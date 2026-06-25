@@ -15,8 +15,7 @@ The Python SDK is available on PyPI as [`mcp`](https://pypi.org/project/mcp/) so
 
 The following dependencies are automatically installed:
 
-- [`httpx`](https://pypi.org/project/httpx/): HTTP client to handle HTTP Streamable and SSE transports.
-- [`httpx-sse`](https://pypi.org/project/httpx-sse/): HTTP client to handle SSE transport.
+- [`httpx2`](https://pypi.org/project/httpx2/): HTTP client to handle HTTP Streamable and SSE transports.
 - [`pydantic`](https://pypi.org/project/pydantic/): Types, JSON schema generation, data validation, and [more](https://docs.pydantic.dev/latest/).
 - [`starlette`](https://pypi.org/project/starlette/): Web framework used to build the HTTP transport endpoints.
 - [`python-multipart`](https://pypi.org/project/python-multipart/): Handle HTTP body parsing.

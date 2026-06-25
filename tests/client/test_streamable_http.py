@@ -10,7 +10,7 @@ import base64
 import json
 
 import anyio
-import httpx
+import httpx2
 import pytest
 from inline_snapshot import snapshot
 
@@ -110,9 +110,9 @@ async def test_pinned_transport_ignores_returned_session_id_and_never_opens_get_
     triggers the client's implicit ``tools/list`` output-schema fetch so there is a second POST
     after the id was offered.
     """
-    recorded: list[httpx.Request] = []
+    recorded: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         recorded.append(request)
         body = json.loads(request.content)
         if body["method"] == "tools/list":
@@ -124,13 +124,13 @@ async def test_pinned_transport_ignores_returned_session_id_and_never_opens_get_
             }
         else:
             result = {"content": [{"type": "text", "text": "5"}], "isError": False, "resultType": "complete"}
-        return httpx.Response(
+        return httpx2.Response(
             200, json={"jsonrpc": "2.0", "id": body["id"], "result": result}, headers={"mcp-session-id": "srv-123"}
         )
 
     with anyio.fail_after(5):
         async with (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http,
             streamable_http_client("http://test/mcp", http_client=http, protocol_version="2026-07-28") as (read, write),
             ClientSession(read, write, protocol_version="2026-07-28") as session,
         ):

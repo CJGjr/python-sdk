@@ -1,7 +1,7 @@
 import re
 from urllib.parse import urljoin, urlparse
 
-from httpx import Request, Response
+from httpx2 import Request, Response
 from pydantic import AnyUrl, ValidationError
 
 from mcp.client.auth import OAuthFlowError, OAuthRegistrationError, OAuthTokenError

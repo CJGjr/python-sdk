@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 import anyio
-import httpx
+import httpx2
 import pytest
 from starlette.types import Receive, Scope, Send
 
@@ -48,13 +48,13 @@ async def test_single_exchange_dispatch_context_has_no_back_channel() -> None:
     assert await dctx.progress(0.5, total=1.0, message="half") is None
 
 
-def _asgi_client(server: Server[Any], security_settings: TransportSecuritySettings | None = None) -> httpx.AsyncClient:
+def _asgi_client(server: Server[Any], security_settings: TransportSecuritySettings | None = None) -> httpx2.AsyncClient:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         async with server.lifespan(server) as lifespan_state:
             await handle_modern_request(server, security_settings, lifespan_state, scope, receive, send)
 
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
+    return httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app),
         base_url="http://testserver",
         headers={MCP_PROTOCOL_VERSION_HEADER: MODERN_PROTOCOL_VERSIONS[0]},
     )
