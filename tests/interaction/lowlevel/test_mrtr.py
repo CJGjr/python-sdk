@@ -13,12 +13,15 @@ push APIs fail loudly (except the in-memory request-scoped leg, a pinned diverge
 input requests cross un-gated to the refusing client driver, and a completed exchange's trace
 carries client requests and server responses only. The error-handling SHOULDs the auto driver
 can never trigger (a missing or unrequested ``inputResponses`` key) are driven through the
-manual ``allow_input_required`` loop, and a trailing scripted-peer section plays the server by
-hand for result bodies a real ``Server`` cannot emit: an absent ``resultType`` (the
-backward-compat default) and an unrecognized ``resultType`` value (a pinned divergence).
+manual ``allow_input_required`` loop. An interim returned on a method outside the supported
+three is refused at the server's result surface and pinned as the JSON-RPC error it becomes. A
+trailing scripted-peer section plays the server by hand for result bodies a real ``Server``
+cannot emit: an absent ``resultType`` (the backward-compat default) and an unrecognized
+``resultType`` value (a pinned divergence), and an embedded input request whose method is
+outside the closed three-type union.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import mcp_types as types
@@ -27,6 +30,7 @@ from inline_snapshot import snapshot
 from mcp_types import (
     CLIENT_CAPABILITIES_META_KEY,
     CLIENT_INFO_META_KEY,
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
@@ -57,7 +61,7 @@ from mcp_types import (
     TextContent,
 )
 from mcp_types.version import LATEST_MODERN_VERSION
-from pydantic import FileUrl
+from pydantic import FileUrl, ValidationError
 
 from mcp import InputRequiredRoundsExceededError, MCPError
 from mcp.client import ClientRequestContext, ClientSession
@@ -344,6 +348,64 @@ async def test_unopted_session_call_with_an_input_required_result_raises_instead
     assert calls == ["ask"]
 
 
+@requirement("protocol:result-type:input-required-not-masked")
+async def test_unopted_session_get_prompt_with_an_input_required_result_raises_instead_of_returning_it() -> None:
+    """The unopted-caller guard is method-generic: a session-surface prompts/get answered with
+    ``input_required`` raises the SDK's guidance error naming the get_prompt retry, never an
+    empty success. Same construction as the tools/call test above; the in-memory 2026 cell.
+    """
+    calls: list[str] = []
+
+    async def get_prompt(ctx: ServerRequestContext, params: types.GetPromptRequestParams) -> InputRequiredResult:
+        assert params.name == "ask"
+        calls.append(params.name)
+        return InputRequiredResult(input_requests={"q": _form_request("Need a name")}, request_state="s")
+
+    server = Server("interim-prompts", on_get_prompt=get_prompt)
+
+    async with Client(server, mode=LATEST_MODERN_VERSION) as client:
+        # Inside the connect block: unwinding through Client.__aexit__ would wrap the error in
+        # ExceptionGroups (task-group teardown), and pytest.raises would miss the bare type.
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.session.get_prompt("ask")
+
+    assert str(exc_info.value) == snapshot(
+        "Server returned InputRequiredResult; pass allow_input_required=True to receive it "
+        "and retry get_prompt(..., input_responses=..., request_state=result.request_state)."
+    )
+    # The handler ran exactly once: no hidden retry preceded the raise.
+    assert calls == ["ask"]
+
+
+@requirement("protocol:result-type:input-required-not-masked")
+async def test_unopted_session_read_resource_with_an_input_required_result_raises_instead_of_returning_it() -> None:
+    """The unopted-caller guard is method-generic: a session-surface resources/read answered with
+    ``input_required`` raises the SDK's guidance error naming the read_resource retry, never an
+    empty success. Same construction as the tools/call test above; the in-memory 2026 cell.
+    """
+    calls: list[str] = []
+
+    async def read_resource(ctx: ServerRequestContext, params: types.ReadResourceRequestParams) -> InputRequiredResult:
+        assert params.uri == "file:///ask.txt"
+        calls.append(params.uri)
+        return InputRequiredResult(input_requests={"q": _form_request("Need a name")}, request_state="s")
+
+    server = Server("interim-resources", on_read_resource=read_resource)
+
+    async with Client(server, mode=LATEST_MODERN_VERSION) as client:
+        # Inside the connect block: unwinding through Client.__aexit__ would wrap the error in
+        # ExceptionGroups (task-group teardown), and pytest.raises would miss the bare type.
+        with pytest.raises(RuntimeError) as exc_info:
+            await client.session.read_resource("file:///ask.txt")
+
+    assert str(exc_info.value) == snapshot(
+        "Server returned InputRequiredResult; pass allow_input_required=True to receive it "
+        "and retry read_resource(..., input_responses=..., request_state=result.request_state)."
+    )
+    # The handler ran exactly once: no hidden retry preceded the raise.
+    assert calls == ["file:///ask.txt"]
+
+
 @requirement("mrtr:input-required-result:at-least-one-of")
 async def test_input_required_result_with_neither_field_cannot_reach_the_client(connect: Connect) -> None:
     """A handler-built InputRequiredResult with neither inputRequests nor requestState cannot
@@ -369,6 +431,36 @@ async def test_input_required_result_with_neither_field_cannot_reach_the_client(
 
     assert exc_info.value.error == snapshot(
         ErrorData(code=INVALID_PARAMS, message="Invalid request parameters", data="")
+    )
+
+
+@requirement("mrtr:input-required-result:supported-requests-only")
+async def test_input_required_result_on_an_unsupported_method_cannot_reach_the_client(connect: Connect) -> None:
+    """A handler-built InputRequiredResult on a method outside the supported three (prompts/get,
+    resources/read, tools/call) cannot cross to the client: the per-method result surface refuses
+    it at serialization and tools/list surfaces a JSON-RPC error, never an interim result (spec:
+    'Servers MUST NOT send InputRequiredResult responses on any other client requests.').
+
+    The error shape is SDK-defined -- the spec mandates no code for a server-side violation. The
+    handler casts past its own annotation because the typed API cannot produce the violation; the
+    runtime result surface, not the type checker, is the enforcement under test.
+    """
+
+    async def list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        # Deliberate annotation violation, reachable from untyped user code; the cast drives the
+        # runtime surface the test pins.
+        return cast("types.ListToolsResult", InputRequiredResult(input_requests={"k": ListRootsRequest()}))
+
+    server = Server("unsupported-interim", on_list_tools=list_tools)
+
+    async with connect(server) as client:
+        with pytest.raises(MCPError) as exc_info:
+            await client.list_tools()
+
+    assert exc_info.value.error == snapshot(
+        ErrorData(code=INTERNAL_ERROR, message="Handler returned an invalid result")
     )
 
 
@@ -890,8 +982,9 @@ async def test_parallel_mrtr_calls_keep_request_state_and_responses_isolated() -
     waits on the other's) forces both loops to be simultaneously mid-flight -- interim results
     received, neither retry sent -- before either retry leaves, so the spec scenario ("any other
     request that the client may be sending in parallel") provably occurs; the exhaustive scan over
-    every recorded tools/call frame is the MUST NOT's proof that neither call's fields leak into
-    the other's.
+    every request frame the client sent -- discovery, tools/list refreshes, and all four
+    tools/call frames -- is the MUST NOT's proof that the fields appear on nothing but each
+    call's own retry.
     """
 
     async def list_tools(
@@ -972,13 +1065,19 @@ async def test_parallel_mrtr_calls_keep_request_state_and_responses_isolated() -
         assert "inputResponses" not in initial
         assert retry["requestState"] == f"state-{name}"
         assert set(retry["inputResponses"]) == {f"q-{name}"}
-    # The exhaustive negative (spec MUST NOT): no recorded tools/call frame anywhere carries the
-    # other call's state or responses.
-    for params in (frame.params for frame in frames):
-        assert params is not None
-        other = "beta" if params["name"] == "alpha" else "alpha"
-        assert params.get("requestState") in (None, f"state-{params['name']}")
-        assert f"q-{other}" not in params.get("inputResponses", {})
+    # The exhaustive negative (spec MUST NOT: the two fields affect only the retry of the
+    # originating request, never "any other request that the client may be sending in parallel"):
+    # across every request frame the client sent, the two retries are the only frames carrying
+    # either field, each scoped to its own call.
+    for frame in (message.message for message in recording.sent if isinstance(message.message, JSONRPCRequest)):
+        params = frame.params or {}
+        if frame.method != "tools/call":
+            assert "requestState" not in params
+            assert "inputResponses" not in params
+        else:
+            other = "beta" if params["name"] == "alpha" else "alpha"
+            assert params.get("requestState") in (None, f"state-{params['name']}")
+            assert f"q-{other}" not in params.get("inputResponses", {})
     assert results == {
         "alpha": CallToolResult(content=[TextContent(text="alpha")]),
         "beta": CallToolResult(content=[TextContent(text="beta")]),
@@ -988,7 +1087,8 @@ async def test_parallel_mrtr_calls_keep_request_state_and_responses_isolated() -
 @requirement("protocol:directionality:no-client-responses")
 async def test_2026_trace_is_client_requests_and_server_responses_only() -> None:
     """A completed 2026 exchange's wire trace is client-sent requests and server-sent responses
-    only -- zero server-initiated requests, zero client-sent responses (spec MUST NOT, both halves).
+    only -- zero server-initiated requests, zero client-sent responses (the spec's directionality
+    sentence: servers MUST NOT initiate requests; clients do not send responses).
 
     The scenario is the maximal legitimate occasion for the forbidden frames: at 2025-11-25 this
     same elicitation was a server-initiated request answered by a client JSON-RPC response; here it
@@ -1041,13 +1141,14 @@ async def test_2026_trace_is_client_requests_and_server_responses_only() -> None
     # the pass, so prove the received log holds messages only before narrowing to them.
     received_messages = [message for message in recording.received if isinstance(message, SessionMessage)]
     assert received_messages == recording.received
-    # The client half of the clause: every client-to-server frame is a request.
+    # The client half of the directionality sentence -- no client-sent responses: this exchange's
+    # trace is requests only.
     assert [
         (type(message.message).__name__, getattr(message.message, "method", None)) for message in recording.sent
     ] == snapshot(
         [("JSONRPCRequest", "tools/call"), ("JSONRPCRequest", "tools/call"), ("JSONRPCRequest", "tools/list")]
     )
-    # The server half of the same sentence: every server-to-client frame is a response.
+    # The server half -- no server-initiated requests: this exchange's trace is responses only.
     assert [type(message.message).__name__ for message in received_messages] == snapshot(
         ["JSONRPCResponse", "JSONRPCResponse", "JSONRPCResponse"]
     )
@@ -1080,8 +1181,9 @@ def _meta_envelope() -> dict[str, object]:
 @requirement("mrtr:input-responses:invalid-rejected")
 async def test_retry_with_malformed_input_responses_is_rejected_with_invalid_params() -> None:
     """A retry whose inputResponses do not parse as a valid InputResponses object is rejected
-    with invalid params before the handler runs (spec SHOULD: validate; the structural arm only --
-    no requestedSchema re-validation happens on this path, and the spec asks for none).
+    with invalid params before the handler runs (spec SHOULD: validate; this clause covers
+    structural parsing only -- requestedSchema validation of elicited content is the separate
+    Form Mode Security contract, tracked with its own requirement and divergence).
 
     Raw httpx against the mounted modern entry because the violation is unproducible above this
     seam: the typed API rejects garbage inputResponses at construction, and the memory-streams
@@ -1263,3 +1365,64 @@ async def test_an_unrecognized_result_type_value_is_surfaced_unchanged_instead_o
         # trip unchanged and the body is a plain successful CallToolResult, never a rejection.
         assert result.result_type == "bogus"
         assert result == snapshot(CallToolResult(content=[TextContent(text="still here")], result_type="bogus"))
+
+
+@requirement("mrtr:input-requests:values-supported-types")
+async def test_an_embedded_input_request_with_an_unknown_method_is_refused_at_result_validation() -> None:
+    """An input_required result whose inputRequests value carries a method outside the three
+    supported request types raises a pydantic ValidationError out of the awaiting call -- the
+    malformed interim never surfaces and never reaches the MRTR driver (spec: inputRequests
+    values 'MUST be one of ElicitRequest, CreateMessageRequest, or ListRootsRequest').
+
+    The test plays the server by hand over memory streams because the typed Server cannot author
+    the violation (InputRequest is the closed three-arm union), and uses the bare pinned-2026
+    ClientSession because Client has no public connect path over raw scripted streams.
+    """
+
+    async def scripted_server(streams: MessageStream) -> None:
+        server_read, server_write = streams
+        call = await server_read.receive()
+        assert isinstance(call, SessionMessage)
+        assert isinstance(call.message, JSONRPCRequest)
+        assert call.message.method == "tools/call"
+        # "ping" is a real protocol method, but outside the closed embedded-request union --
+        # exactly the value the MUST excludes.
+        await server_write.send(
+            SessionMessage(
+                JSONRPCResponse(
+                    jsonrpc="2.0",
+                    id=call.message.id,
+                    result={"resultType": "input_required", "inputRequests": {"k": {"method": "ping"}}},
+                )
+            )
+        )
+        # Returns naturally: the failed call triggers no output-schema cache refresh.
+
+    async with (
+        create_client_server_memory_streams() as ((client_read, client_write), server_streams),
+        anyio.create_task_group() as task_group,
+        ClientSession(client_read, client_write, client_info=Implementation(name="cli", version="0")) as session,
+    ):
+        task_group.start_soon(scripted_server, server_streams)
+        session.adopt(
+            DiscoverResult(
+                supported_versions=[LATEST_MODERN_VERSION],
+                capabilities=ServerCapabilities(),
+                server_info=Implementation(name="srv", version="0"),
+            )
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            with anyio.fail_after(5):
+                await session.call_tool("t", {}, allow_input_required=True)
+
+        # Stable pydantic-core identifiers: each union arm rejects the unknown method at the
+        # embedded request's loc. The remaining errors (missing params/content on the other arms)
+        # are third-party union noise and deliberately unpinned.
+        method_errors = {
+            (error["loc"], error["type"]) for error in excinfo.value.errors() if error["loc"][-1] == "method"
+        }
+        assert method_errors == {
+            (("InputRequiredResult", "inputRequests", "k", "CreateMessageRequest", "method"), "literal_error"),
+            (("InputRequiredResult", "inputRequests", "k", "ListRootsRequest", "method"), "literal_error"),
+            (("InputRequiredResult", "inputRequests", "k", "ElicitRequest", "method"), "literal_error"),
+        }

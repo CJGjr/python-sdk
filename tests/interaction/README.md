@@ -118,6 +118,13 @@ be exercised by at least one test, every deferred requirement by none, and an un
 import time. A behaviour without a manifest entry cannot be silently half-tested, and a manifest
 entry without a test cannot be silently aspirational.
 
+Coverage is enforced per matrix cell as well: every (transport, spec version) cell a
+requirement's own grid admits must appear in the cells of at least one test covering it, so a
+version- or transport-bounded mark stacked onto a shared test cannot silently strip cells — an
+era, a transport — from the other requirements that test covers. A covering test that does not
+use the `connect` fixture counts for every admitted cell: it runs unparametrized, so no stacked
+mark can strip anything from it.
+
 ### The divergence lifecycle
 
 1. A test reveals that the SDK does not do what the spec says. The test pins what the SDK
@@ -143,9 +150,11 @@ exercises. `SPEC_BASE_URL` (and `SPEC_2026_BASE_URL`) are pinned literals — no
 `SPEC_VERSIONS` — so growing the active axis never repoints existing `source` links. The
 `connect` fixture fans out over `CONNECTABLE_TRANSPORTS × SPEC_VERSIONS`, but the grid is
 filtered per test:
-`pytest_generate_tests` reads the test's stacked `@requirement` marks and calls `compute_cells()`,
-which intersects the admissible cells across every cited requirement — a cell survives only if
-**all** of the test's requirements admit it.
+`pytest_generate_tests` reads the test's stacked `@requirement` marks and calls `cells_for_test()`
+(a thin wrapper over `compute_cells()`), which intersects the admissible cells across every cited
+requirement — a cell survives only if **all** of the test's requirements admit it. A stack whose
+intersection is empty fails collection: a `connect` test that can never run on any cell is a
+manifest contradiction, not a skip.
 
 `streamable-http-stateless` is the fourth connectable transport: the 2025-era unofficial stateless
 mode where each request opens a fresh transport, no session id is issued, and there is no standalone

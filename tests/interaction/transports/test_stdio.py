@@ -47,6 +47,7 @@ _REPO_ROOT = Path(__file__).parents[3]
 @requirement("transport:stdio")
 @requirement("transport:stdio:clean-shutdown")
 @requirement("transport:stdio:stderr-passthrough")
+@requirement("transport:stdio:default-env-safelist")
 async def test_tool_call_and_notification_round_trip_over_a_stdio_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -54,7 +55,8 @@ async def test_tool_call_and_notification_round_trip_over_a_stdio_subprocess(
 
     The Client initializes, calls a tool with arguments, and receives the server's log
     notification before the call returns; the server exits when the transport closes its
-    stdin.
+    stdin. The child sees only the safelisted environment plus the explicitly passed
+    variables: a parent-only variable does not reach it.
     """
     # After stdin closes, the child must unwind, flush its subprocess coverage data, and write
     # the clean-exit line before escalation (the server saves coverage *before* printing, so a
@@ -65,6 +67,10 @@ async def test_tool_call_and_notification_round_trip_over_a_stdio_subprocess(
     # badly starved runner (a >10s stall has been seen once in CI) and costs nothing when the
     # child exits promptly. Not under test.
     monkeypatch.setattr(stdio, "PROCESS_TERMINATION_TIMEOUT", 20.0)
+
+    # Set in the parent only: it is in neither the platform safelist nor the explicit env=
+    # below, so the child must not see it.
+    monkeypatch.setenv("MCP_SUITE_PARENT_ONLY", "do-not-inherit")
 
     received: list[LoggingMessageNotificationParams] = []
 
@@ -92,6 +98,9 @@ async def test_tool_call_and_notification_round_trip_over_a_stdio_subprocess(
             async with Client(transport, mode="legacy", logging_callback=collect) as client:
                 assert client.server_info.name == "stdio-echo"
                 result = await client.call_tool("echo", {"text": "across\nprocesses"})
+                parent_only = await client.call_tool("read_env", {"name": "MCP_SUITE_PARENT_ONLY"})
+                explicit = await client.call_tool("read_env", {"name": "PYTHONWARNINGS"})
+                safelisted = await client.call_tool("read_env", {"name": "PATH"})
 
         errlog.seek(0)
         captured_stderr = errlog.read()
@@ -105,6 +114,16 @@ async def test_tool_call_and_notification_round_trip_over_a_stdio_subprocess(
     # The server writes this line only after its run loop returns on stdin close: seeing it proves
     # a self-exit, not the terminate escalation. The capture itself proves stderr passthrough.
     assert captured_stderr == snapshot("stdio-echo: clean exit\n")
+    # The parent-only variable never reached the child: stdio_client spawned it with the safelist,
+    # not the parent's environment.
+    assert parent_only == snapshot(CallToolResult(content=[TextContent(text="<unset>")]))
+    # An explicitly passed variable is merged over the safelist and visible to the child.
+    assert explicit == snapshot(CallToolResult(content=[TextContent(text="ignore::SyntaxWarning")]))
+    # PATH is on the safelist for both platforms; its value is machine-specific, so assert
+    # presence only.
+    block = safelisted.content[0]
+    assert isinstance(block, TextContent)
+    assert block.text != "<unset>"
 
 
 @requirement("transport:stdio:stream-purity")

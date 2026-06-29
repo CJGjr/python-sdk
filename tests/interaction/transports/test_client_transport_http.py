@@ -14,6 +14,7 @@ import mcp_types as types
 import pytest
 from inline_snapshot import snapshot
 from mcp_types import INVALID_REQUEST, CallToolResult, ErrorData, ListToolsResult, TextContent, Tool
+from mcp_types.version import LATEST_MODERN_VERSION
 from starlette.types import Message, Receive, Scope, Send
 
 from mcp import MCPError
@@ -293,3 +294,55 @@ async def test_sse_comment_lines_in_the_response_stream_are_ignored_by_the_clien
     # Non-vacuity anchor: at least the initialize, tools/list, and tools/call SSE responses each
     # had a comment line prepended (exactly 3 observed; ">=" because chunking is bridge-internal).
     assert len(injected) >= 3
+
+
+@requirement("client-transport:http:stateless-ignores-session-id")
+async def test_a_pinned_client_ignores_a_volunteered_session_id_and_keeps_the_wire_post_only() -> None:
+    """Offered a session id on every response, a 2026-pinned client never echoes it and stays POST-only.
+
+    No SDK server volunteers Mcp-Session-Id on the modern path, so the misbehaving peer is scripted
+    at the ASGI seam: a shim appends the header to every response of the real app. Spec-mandated:
+    the modern revision retired protocol-level sessions, the standalone GET stream, and the closing
+    DELETE, and every client message MUST be a new POST.
+    """
+    server = _tooled_server()
+    real_app = server.streamable_http_app(transport_security=NO_DNS_REBINDING_PROTECTION)
+
+    async def volunteer_session_id(scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_session_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []), (b"mcp-session-id", b"srv-123")]}
+            await send(message)
+
+        await real_app(scope, receive, send_with_session_id)
+
+    requests: list[httpx.Request] = []
+    responses: list[httpx.Response] = []
+
+    async def record_request(request: httpx.Request) -> None:
+        requests.append(request)
+
+    async def record_response(response: httpx.Response) -> None:
+        responses.append(response)
+
+    async with (
+        server.session_manager.run(),
+        httpx.AsyncClient(
+            transport=StreamingASGITransport(volunteer_session_id),
+            base_url=BASE_URL,
+            event_hooks={"request": [record_request], "response": [record_response]},
+        ) as http_client,
+        Client(
+            streamable_http_client(f"{BASE_URL}/mcp", http_client=http_client), mode=LATEST_MODERN_VERSION
+        ) as client,
+    ):
+        with anyio.fail_after(5):
+            tools = await client.list_tools()
+            result = await client.call_tool("echo", {"text": "hi"})
+
+    assert [tool.name for tool in tools.tools] == ["echo"]
+    assert result == snapshot(CallToolResult(content=[TextContent(text="hi")]))
+    # Non-vacuity anchor: the misbehaving peer really offered the session id on every response.
+    assert [response.headers["mcp-session-id"] for response in responses] == ["srv-123", "srv-123"]
+    assert [request.method for request in requests] == ["POST", "POST"]
+    assert all("mcp-session-id" not in request.headers for request in requests)

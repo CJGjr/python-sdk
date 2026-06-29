@@ -1,9 +1,11 @@
 """Cancellation interactions against the low-level Server, driven through the public Client API.
 
-There is no client-side cancellation API: cancelling means sending a CancelledNotification
-carrying the request id, which only the server-side handler can observe (`ctx.request_id`), so
-these tests capture the id from inside the blocked handler before cancelling. The handler blocks
-on an Event rather than a sleep, and every wait is bounded by `anyio.fail_after`.
+Client-side cancellation is cancelling the caller's scope around an in-flight call; the
+dispatcher then sends the courtesy notifications/cancelled. The receiving-side tests instead
+drive the wire act directly -- sending a CancelledNotification carrying the request id, which
+only the server-side handler can observe (`ctx.request_id`) -- so they capture the id from
+inside the blocked handler before cancelling. Handlers block on an Event rather than a sleep,
+and every wait is bounded by `anyio.fail_after`.
 """
 
 import anyio
@@ -27,14 +29,62 @@ from mcp_types import (
 
 from mcp import MCPError
 from mcp.client import ClientRequestContext, ClientSession
+from mcp.client._memory import InMemoryTransport
+from mcp.client.client import Client
 from mcp.server import Server, ServerRequestContext
 from mcp.shared.memory import MessageStream, create_client_server_memory_streams
 from mcp.shared.message import SessionMessage
 from tests.interaction._connect import Connect
-from tests.interaction._helpers import IncomingMessage
+from tests.interaction._helpers import IncomingMessage, RecordingTransport
 from tests.interaction._requirements import requirement
 
 pytestmark = pytest.mark.anyio
+
+
+@requirement("protocol:cancel:abort-signal")
+async def test_cancelling_the_callers_scope_sends_cancelled_and_abandons_the_call() -> None:
+    """Cancelling the scope around an in-flight call sends notifications/cancelled and the call never returns.
+
+    Spec-mandated (cancellation flow): the sender of a cancelled request issues
+    notifications/cancelled referencing its id. Legacy-era act: at 2026-07-28 the wire act splits
+    by transport (see the manifest entry's note). The wire is observed at the recording-transport
+    seam; the reason string is the SDK's own deliberate output.
+    """
+    handler_started = anyio.Event()
+
+    async def call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams) -> CallToolResult:
+        assert params.name == "block"
+        handler_started.set()
+        await anyio.Event().wait()  # blocks until the courtesy cancellation interrupts it
+        raise NotImplementedError  # unreachable: the wait above never completes normally
+
+    server = Server("blocker", on_call_tool=call_tool)
+    recording = RecordingTransport(InMemoryTransport(server))
+
+    async with Client(recording, mode="legacy") as client:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as task_group:  # pragma: no branch
+
+                async def call() -> None:
+                    await client.call_tool("block", {})
+                    raise NotImplementedError  # unreachable: the surrounding scope is cancelled mid-flight
+
+                task_group.start_soon(call)
+                await handler_started.wait()
+                task_group.cancel_scope.cancel()
+
+    (call_request,) = [
+        item.message
+        for item in recording.sent
+        if isinstance(item.message, JSONRPCRequest) and item.message.method == "tools/call"
+    ]
+    (cancellation,) = [
+        item.message
+        for item in recording.sent
+        if isinstance(item.message, JSONRPCNotification) and item.message.method == "notifications/cancelled"
+    ]
+    assert cancellation.params == snapshot({"requestId": 2, "reason": "caller cancelled"})
+    assert cancellation.params is not None and cancellation.params["requestId"] == call_request.id
 
 
 @requirement("protocol:cancel:in-flight")
@@ -84,6 +134,77 @@ async def test_cancellation_stops_in_flight_handler(connect: Connect) -> None:
 
             await handler_cancelled.wait()
 
+    assert errors == snapshot([ErrorData(code=0, message="Request cancelled")])
+
+
+@requirement("protocol:cancel:in-flight")
+async def test_client_answers_a_cancelled_server_initiated_request_with_the_code_zero_error(connect: Connect) -> None:
+    """Cancelling a server-initiated request interrupts the client's callback, and the client
+    answers with the code-0 error -- the client half of the divergence on this requirement (the
+    spec says the receiver should not respond at all). The server cancels its own sampling
+    request while still awaiting it, so the client's answer is observed as the awaited call's
+    failure; the whole exchange sits under one fail_after, so a silent client fails the test
+    instead of hanging it.
+    """
+    callback_started = anyio.Event()
+    callback_cancelled = anyio.Event()
+    client_request_ids: list[types.RequestId] = []
+    errors: list[ErrorData] = []
+
+    async def sampling_callback(
+        context: ClientRequestContext, params: types.CreateMessageRequestParams
+    ) -> types.CreateMessageResult:
+        client_request_ids.append(context.request_id)
+        callback_started.set()
+        try:
+            await anyio.Event().wait()  # blocks until the cancellation interrupts it
+        except anyio.get_cancelled_exc_class():
+            callback_cancelled.set()
+            raise
+        raise NotImplementedError  # unreachable
+
+    async def list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(tools=[types.Tool(name="canceller", input_schema={"type": "object"})])
+
+    async def call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams) -> CallToolResult:
+        assert params.name == "canceller"
+        request = types.CreateMessageRequest(
+            params=types.CreateMessageRequestParams(
+                messages=[types.SamplingMessage(role="user", content=TextContent(text="Say hello."))],
+                max_tokens=8,
+            )
+        )
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as task_group:
+
+                async def sample_and_capture_error() -> None:
+                    with pytest.raises(MCPError) as exc_info:
+                        await ctx.session.send_request(request, types.CreateMessageResult)
+                    errors.append(exc_info.value.error)
+
+                task_group.start_soon(sample_and_capture_error)
+                await callback_started.wait()
+                await ctx.session.send_notification(
+                    types.CancelledNotification(
+                        params=types.CancelledNotificationParams(
+                            request_id=client_request_ids[0], reason="user aborted"
+                        )
+                    ),
+                    related_request_id=ctx.request_id,
+                )
+            # The join above completes only when the client's answer arrives; the enclosing
+            # fail_after turns a silent client into a TimeoutError -- a failed test, not a hang.
+            await callback_cancelled.wait()
+        return CallToolResult(content=[TextContent(text="cancelled")])
+
+    server = Server("canceller", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    async with connect(server, sampling_callback=sampling_callback) as client:
+        result = await client.call_tool("canceller", {})
+
+    assert result == snapshot(CallToolResult(content=[TextContent(text="cancelled")]))
     assert errors == snapshot([ErrorData(code=0, message="Request cancelled")])
 
 

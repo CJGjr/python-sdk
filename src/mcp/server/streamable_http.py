@@ -686,7 +686,7 @@ class StreamableHTTPServerTransport:
             "Content-Type": CONTENT_TYPE_SSE,
         }
 
-        if self.mcp_session_id:  # pragma: no branch
+        if self.mcp_session_id:
             headers[MCP_SESSION_ID_HEADER] = self.mcp_session_id
 
         # Check if we already have an active GET stream
@@ -750,7 +750,7 @@ class StreamableHTTPServerTransport:
     async def _handle_delete_request(self, request: Request, send: Send) -> None:
         """Handle DELETE requests for explicit session termination."""
         # Validate session ID
-        if not self.mcp_session_id:  # pragma: no cover
+        if not self.mcp_session_id:
             # If no session ID set, return Method Not Allowed
             response = self._create_error_response(
                 "Method Not Allowed: Session termination not supported",

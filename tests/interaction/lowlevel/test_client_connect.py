@@ -5,10 +5,13 @@ the legacy initialize handshake, the modern `server/discover` probe, or nothing 
 that a modern-negotiated session stamps the three-key `io.modelcontextprotocol/*` `_meta`
 envelope on every subsequent request. Each test drives the highest public surface (`Client`)
 and observes traffic at a recording seam: `RecordingTransport` for the legacy stream pair, and
-`mounted_app`'s httpx event hook for the in-process streamable-HTTP transport.
+`mounted_app`'s httpx event hook for the in-process streamable-HTTP transport. Two further tests
+pin the connect seam itself: a consumer-implemented `Transport` carries the handshake, and a
+transport fault during connect reaches `message_handler`.
 
-The fallback test alone hand-plays the server's side of the wire, because no real `Server`
-answers `server/discover` with -32601.
+Two tests hand-play the server's side of the wire: the fallback test, because no real `Server`
+answers `server/discover` with -32601, and the transport-fault test, because only a transport
+puts an Exception item on the read stream and the in-process transports always parse.
 """
 
 import json
@@ -27,6 +30,7 @@ from mcp_types import (
     METHOD_NOT_FOUND,
     PROTOCOL_VERSION_META_KEY,
     UNSUPPORTED_PROTOCOL_VERSION,
+    CallToolResult,
     CompletionsCapability,
     DiscoverResult,
     Implementation,
@@ -35,13 +39,18 @@ from mcp_types import (
     JSONRPCNotification,
     JSONRPCRequest,
     JSONRPCResponse,
+    ListToolsResult,
     PromptsCapability,
+    ResourcesCapability,
     ServerCapabilities,
+    TextContent,
+    Tool,
     ToolsCapability,
 )
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION, MODERN_PROTOCOL_VERSIONS
 
 from mcp import MCPError
+from mcp.client import ClientSession
 from mcp.client._memory import InMemoryTransport
 from mcp.client._transport import TransportStreams
 from mcp.client.client import Client
@@ -50,7 +59,7 @@ from mcp.server import Server, ServerRequestContext
 from mcp.shared.memory import MessageStream, create_client_server_memory_streams
 from mcp.shared.message import SessionMessage
 from tests.interaction._connect import BASE_URL, Connect, mounted_app
-from tests.interaction._helpers import RecordingTransport
+from tests.interaction._helpers import IncomingMessage, RecordingTransport
 from tests.interaction._requirements import requirement
 
 pytestmark = pytest.mark.anyio
@@ -157,9 +166,10 @@ async def test_prior_discover_populates_state_with_zero_connect_time_traffic() -
 async def test_auto_mode_probes_server_discover_and_adopts_the_result() -> None:
     """`Client(..., mode='auto')` sends `server/discover` first and adopts the returned version and server_info.
 
-    Requirement `lifecycle:discover:basic` (spec server/discover): the probe is a
-    single `server/discover` request whose result carries supported versions, capabilities,
-    server_info and the cache-hint fields, after which the session is modern-negotiated.
+    Requirement `lifecycle:discover:basic` (spec server/discover): the probe is a single
+    `server/discover` request carrying no params beyond the standard `_meta` envelope, whose
+    result carries supported versions, capabilities, server_info and the cache-hint fields,
+    after which the session is modern-negotiated.
     """
     requests, on_request = _request_recorder()
     server = _tools_server("discoverable")
@@ -175,7 +185,41 @@ async def test_auto_mode_probes_server_discover_and_adopts_the_result() -> None:
 
     bodies = [json.loads(r.content) for r in requests]
     assert bodies[0]["method"] == "server/discover"
+    assert list(bodies[0]["params"].keys()) == ["_meta"]
     assert "initialize" not in [b["method"] for b in bodies]
+
+
+@requirement("lifecycle:discover:basic")
+async def test_explicit_discover_on_a_fresh_session_sends_the_probe_and_returns_the_typed_result() -> None:
+    """`ClientSession.discover()` with no prior probe sends one `server/discover` and returns the typed result.
+
+    Requirement `lifecycle:discover:basic` (spec server/discover): the probe carries no params
+    beyond the standard `_meta` envelope and the result is a typed DiscoverResult carrying
+    supportedVersions, capabilities and serverInfo. `ClientSession` is reached directly because
+    no `Client` configuration leaves `discover()` the fresh probe: auto mode probes through the
+    connect-time policy and a version pin adopts a synthesized local result.
+    """
+    requests, on_request = _request_recorder()
+    server = Server("discoverable", version="1.2.3")
+
+    with anyio.fail_after(5):
+        async with (
+            mounted_app(server, on_request=on_request) as (http, _),
+            streamable_http_client(f"{BASE_URL}/mcp", http_client=http) as (read, write),
+            ClientSession(read, write) as session,
+        ):
+            result = await session.discover()
+
+    assert result == snapshot(
+        DiscoverResult(
+            supported_versions=["2026-07-28"],
+            capabilities=ServerCapabilities(),
+            server_info=Implementation(name="discoverable", version="1.2.3"),
+        )
+    )
+    bodies = [json.loads(r.content) for r in requests]
+    assert [b["method"] for b in bodies] == ["server/discover"]
+    assert list(bodies[0]["params"].keys()) == ["_meta"]
 
 
 @requirement("lifecycle:discover:retry-on-32022")
@@ -321,7 +365,7 @@ async def test_auto_mode_falls_back_to_initialize_on_a_legacy_probe_rejection(
 async def test_every_request_on_a_modern_session_carries_the_three_key_meta_envelope(connect: Connect) -> None:
     """Each modern-session request's `params._meta` carries protocolVersion, clientInfo and clientCapabilities.
 
-    Requirement `lifecycle:envelope:stamped-on-every-request` (spec basic#_meta): the per-request
+    Requirement `lifecycle:envelope:stamped-on-every-request` (spec basic#meta): the per-request
     envelope replaces the initialize handshake's once-per-session exchange. Asserted server-side
     by capturing `ctx.meta` inside the handler.
     """
@@ -403,15 +447,23 @@ async def test_discover_capabilities_reflect_registered_handlers() -> None:
     capabilities derive from the registered handlers; the full-object snapshot proves the
     unregistered areas stay None, and the bare server advertises nothing at all. `list_changed=False`
     comes from the default NotificationOptions, as in the 2025 initialize sibling. Only era-clean
-    areas (tools/prompts/completions) are registered on purpose: the derivation is era-agnostic, so
-    a subscribe or logging handler would advertise a capability whose method is era-removed at
-    2026-07-28 -- a quirk deliberately left unpinned here.
+    areas (tools/resources/prompts/completions) are registered on purpose: the derivation is
+    era-agnostic, so a subscribe or logging handler would advertise a capability whose method is
+    era-removed at 2026-07-28 -- a quirk deliberately left unpinned here. The resources capability
+    shows subscribe=False because resources/subscribe is one of those era-removed methods and
+    stays unregistered.
     """
 
     async def list_tools(
         ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
     ) -> types.ListToolsResult:
         """Registered only so the tools capability is advertised; never called."""
+        raise NotImplementedError
+
+    async def list_resources(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListResourcesResult:
+        """Registered only so the resources capability is advertised; never called."""
         raise NotImplementedError
 
     async def list_prompts(
@@ -424,7 +476,13 @@ async def test_discover_capabilities_reflect_registered_handlers() -> None:
         """Registered only so the completions capability is advertised; never called."""
         raise NotImplementedError
 
-    server = Server("capable", on_list_tools=list_tools, on_list_prompts=list_prompts, on_completion=completion)
+    server = Server(
+        "capable",
+        on_list_tools=list_tools,
+        on_list_resources=list_resources,
+        on_list_prompts=list_prompts,
+        on_completion=completion,
+    )
 
     with anyio.fail_after(5):
         async with Client(server) as client:
@@ -432,6 +490,7 @@ async def test_discover_capabilities_reflect_registered_handlers() -> None:
             assert client.server_capabilities == snapshot(
                 ServerCapabilities(
                     prompts=PromptsCapability(list_changed=False),
+                    resources=ResourcesCapability(subscribe=False, list_changed=False),
                     completions=CompletionsCapability(),
                     tools=ToolsCapability(list_changed=False),
                 )
@@ -537,3 +596,106 @@ async def test_auto_mode_raises_when_discover_rejects_with_a_disjoint_supported_
                     raise NotImplementedError("entering the Client should have raised")  # pragma: no cover
 
     assert [json.loads(r.content)["method"] for r in requests] == ["server/discover"]
+
+
+@requirement("transport:custom:client-connect")
+async def test_client_completes_the_handshake_over_a_consumer_implemented_transport() -> None:
+    """Client accepts a consumer-implemented Transport -- an async context manager yielding the
+    stream pair -- and completes the handshake and a tool call over it.
+
+    SDK-defined: `mcp.client.Transport` is the public seam for consumer transports. The transport
+    here fronts a real `Server` over a memory stream pair, the shape of a consumer bridge
+    transport; mode='legacy' because a raw stream pair reaches the stream-loop server, which
+    serves only the initialize era.
+    """
+
+    async def list_tools(ctx: ServerRequestContext, params: types.PaginatedRequestParams | None) -> ListToolsResult:
+        return ListToolsResult(tools=[Tool(name="add", input_schema={"type": "object"})])
+
+    async def call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams) -> CallToolResult:
+        assert params.name == "add"
+        assert params.arguments is not None
+        return CallToolResult(content=[TextContent(text=str(params.arguments["a"] + params.arguments["b"]))])
+
+    server = Server("custom-transport", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    @asynccontextmanager
+    async def consumer_transport() -> AsyncIterator[TransportStreams]:
+        async with (
+            create_client_server_memory_streams() as ((client_read, client_write), (server_read, server_write)),
+            anyio.create_task_group() as tg,
+        ):
+            tg.start_soon(server.run, server_read, server_write, server.create_initialization_options())
+            yield client_read, client_write
+            tg.cancel_scope.cancel()
+
+    with anyio.fail_after(5):
+        async with Client(consumer_transport(), mode="legacy") as client:
+            assert client.server_info.name == "custom-transport"
+            result = await client.call_tool("add", {"a": 2, "b": 3})
+
+    assert result == snapshot(CallToolResult(content=[TextContent(text="5")]))
+
+
+@requirement("lifecycle:connect:onerror-pre-handshake")
+async def test_a_transport_fault_during_connect_reaches_message_handler_and_connect_completes() -> None:
+    """An Exception item on the read stream while connect is in flight is delivered to
+    message_handler, and the handshake still completes.
+
+    SDK-defined. Transports signal unparseable input by putting an Exception on the read stream
+    (the stdio parse loop, pinned in tests/client/test_stdio.py); message_handler is a constructor
+    argument, so there is no wiring-order half to pin. The test plays the transport's side of the
+    wire by hand because the in-process transports never fail to parse.
+    """
+    fault = ValueError("transport could not parse a line")
+    surfaced: list[IncomingMessage] = []
+    delivered = anyio.Event()
+
+    async def record(message: IncomingMessage) -> None:
+        surfaced.append(message)
+        delivered.set()
+
+    async def scripted_transport_peer(streams: MessageStream) -> None:
+        server_read, server_write = streams
+        init = await server_read.receive()
+        assert isinstance(init, SessionMessage)
+        assert isinstance(init.message, JSONRPCRequest)
+        assert init.message.method == "initialize"
+        # The fault lands between the initialize request and its response: mid-connect.
+        await server_write.send(fault)
+        result = InitializeResult(
+            protocol_version=LATEST_HANDSHAKE_VERSION,
+            capabilities=ServerCapabilities(),
+            server_info=Implementation(name="faulty-wire", version="0.0.1"),
+        )
+        await server_write.send(
+            SessionMessage(
+                JSONRPCResponse(
+                    jsonrpc="2.0",
+                    id=init.message.id,
+                    result=result.model_dump(by_alias=True, mode="json", exclude_none=True),
+                )
+            )
+        )
+        initialized = await server_read.receive()
+        assert isinstance(initialized, SessionMessage)
+        assert isinstance(initialized.message, JSONRPCNotification)
+        assert initialized.message.method == "notifications/initialized"
+
+    @asynccontextmanager
+    async def faulting_transport() -> AsyncIterator[TransportStreams]:
+        async with (
+            create_client_server_memory_streams() as ((client_read, client_write), server_streams),
+            anyio.create_task_group() as tg,
+        ):
+            tg.start_soon(scripted_transport_peer, server_streams)
+            yield client_read, client_write
+            tg.cancel_scope.cancel()
+
+    with anyio.fail_after(5):
+        async with Client(faulting_transport(), mode="legacy", message_handler=record) as client:
+            assert client.server_info.name == "faulty-wire"
+            await delivered.wait()
+
+    assert len(surfaced) == 1
+    assert surfaced[0] is fault

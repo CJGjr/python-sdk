@@ -175,14 +175,14 @@ async def test_a_refresh_response_without_a_refresh_token_preserves_the_stored_o
     """A refresh response that omits `refresh_token` leaves the stored one in place.
 
     RFC 6749 §6 lets the authorization server omit `refresh_token` from a refresh response, in
-    which case the client keeps the one it holds; the 2026 Refresh Tokens section (SEP-2207)
-    restates this as "MUST NOT assume refresh tokens will be issued". The provider models the
-    non-rotating AS: its refresh response carries only a new access token (`exclude_none`
-    serialization keeps the key genuinely absent from the wire) and the presented token stays
-    valid server-side. The preserved token alone could pass vacuously if the refresh response
-    were dropped entirely, so the adopted `expires_in` (the first token's was -3600) proves it
-    was not, and the single authorize/register pair proves the omission was treated as normal
-    rather than triggering a re-authorization.
+    which case the client keeps the one it holds -- the discipline the 2026 Refresh Tokens
+    section's "MUST NOT assume refresh tokens will be issued" (SEP-2207) states for issuance
+    generally. The provider models the non-rotating AS: its refresh response carries only a new
+    access token (`exclude_none` serialization keeps the key genuinely absent from the wire) and
+    the presented token stays valid server-side. The preserved token alone could pass vacuously
+    if the refresh response were dropped entirely, so the adopted `expires_in` (the first
+    token's was -3600) proves it was not, and the single authorize/register pair proves the
+    omission was treated as normal rather than triggering a re-authorization.
     """
     recorded, on_request = record_requests()
     provider = InMemoryAuthorizationServerProvider(issue_expired_first=True, rotate_refresh_tokens=False)
@@ -260,8 +260,10 @@ async def test_a_403_step_up_re_authorizes_with_the_union_of_prior_and_challenge
     """The step-up re-authorize requests the union of the previously requested and challenged scopes.
 
     The first authorization requests `mcp`; the 403 challenges a disjoint `write` (not naming
-    `mcp`). Per SEP-2350 the client must re-authorize with `mcp write`, not drop `mcp`. The client
-    is pre-registered with both scopes so the server's authorize handler accepts the wider request.
+    `mcp`). The client re-authorizes with `mcp write`, not dropping `mcp` -- the SEP-2350 union,
+    spec-mandated at 2026-07-28; on this legacy flow it is the SDK's own choice anticipating that
+    mandate. The client is pre-registered with both scopes so the server's authorize handler
+    accepts the wider request.
     """
     provider = InMemoryAuthorizationServerProvider()
     storage = InMemoryTokenStorage(client_info=seeded_client(provider, scope="mcp write"))
@@ -325,11 +327,14 @@ async def test_tokens_from_the_previous_authorization_server_are_never_replayed_
 
     Choreography twin of the as-binding discard test above, pinning the token half of the same
     SEP-2352 branch: storage carries both an old-issuer client registration and that server's
-    tokens. The stale access token is presented once to the resource server (reload treats it
-    as live), the 401 triggers the binding check, and the discard drops tokens together with
-    the credentials -- so the stale refresh token reaches no endpoint of the new authorization
-    server and the only token exchange is the fresh authorization-code grant. The requirement's
-    note carries the refresh-ordering hazard this test is the regression net for.
+    tokens, with the access token seeded already expired. Reload loses the expiry clock, so the
+    stale access token is presented once to the resource server, the 401 triggers the binding
+    check, and the discard drops tokens together with the credentials -- the stale refresh token
+    reaches no endpoint of the new authorization server and the only token exchange is the fresh
+    authorization-code grant. The expired seed arms the net for a fix that re-anchors the expiry
+    clock at reload: the pre-discovery refresh branch then engages in this exact scenario, and
+    the replay sweep fails unless the discard still runs ahead of any refresh attempt. The
+    requirement's note carries the refresh-ordering hazard in full.
     """
     recorded, on_request = record_requests()
     provider = InMemoryAuthorizationServerProvider()
@@ -349,7 +354,10 @@ async def test_tokens_from_the_previous_authorization_server_are_never_replayed_
     storage.tokens = OAuthToken(
         access_token="stale-access-token",
         token_type="Bearer",
-        expires_in=3600,
+        # Seeded already expired: today reload loses the expiry clock and treats the token as
+        # live; if a fix re-anchors it, this seed drives the pre-discovery refresh branch --
+        # the ordering hazard the replay sweep below must catch.
+        expires_in=-3600,
         scope="mcp",
         refresh_token="stale-refresh-token",
     )

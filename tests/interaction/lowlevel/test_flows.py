@@ -20,8 +20,10 @@ from mcp_types import (
     ElicitRequestURLParams,
     ElicitResult,
     EmptyResult,
+    ListResourcesResult,
     ListToolsResult,
     ReadResourceResult,
+    Resource,
     ResourceLink,
     TextContent,
     TextResourceContents,
@@ -30,6 +32,7 @@ from mcp_types import (
 
 from mcp import MCPError, UrlElicitationRequiredError
 from mcp.client import ClientRequestContext
+from mcp.client.client import Client
 from mcp.server import Server, ServerRequestContext
 from mcp.server.session import ServerSession
 from tests.interaction._connect import Connect
@@ -202,3 +205,53 @@ async def test_a_tool_rejected_with_url_elicitation_required_succeeds_on_retry_a
         result = await client.call_tool("read_files", {})
 
     assert result == snapshot(CallToolResult(content=[TextContent(text="contents")]))
+
+
+@requirement("flow:proxy:forward-tools-resources")
+async def test_a_proxy_server_forwards_upstream_tool_and_resource_lists_intact() -> None:
+    """A proxy pairing a lowlevel Server (downstream) with a Client (upstream) forwards tools/list
+    and resources/list; the downstream caller sees the upstream names, schemas, and _meta unchanged.
+
+    SDK-defined: the mcp-proxy / mcp-remote composition shape. Pass-through is asserted against
+    the very models the upstream handler returned; both hops run in-memory.
+    """
+    upstream_tool = Tool(
+        name="upstream-add",
+        input_schema={"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+        _meta={"origin": "upstream"},
+    )
+    upstream_resource = Resource(name="manual", uri="memo://manual", _meta={"origin": "upstream"})
+
+    async def upstream_list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> ListToolsResult:
+        return ListToolsResult(tools=[upstream_tool])
+
+    async def upstream_list_resources(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> ListResourcesResult:
+        return ListResourcesResult(resources=[upstream_resource])
+
+    upstream = Server("upstream", on_list_tools=upstream_list_tools, on_list_resources=upstream_list_resources)
+
+    with anyio.fail_after(5):
+        async with Client(upstream) as upstream_client:
+
+            async def proxy_list_tools(
+                ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+            ) -> ListToolsResult:
+                return await upstream_client.list_tools()
+
+            async def proxy_list_resources(
+                ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+            ) -> ListResourcesResult:
+                return await upstream_client.list_resources()
+
+            proxy = Server("proxy", on_list_tools=proxy_list_tools, on_list_resources=proxy_list_resources)
+
+            async with Client(proxy) as downstream:  # pragma: no branch
+                tools = await downstream.list_tools()
+                resources = await downstream.list_resources()
+
+    assert tools.tools == [upstream_tool]
+    assert resources.resources == [upstream_resource]

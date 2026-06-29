@@ -50,9 +50,12 @@ async def test_progress_during_tool_call_reaches_callback_in_order(connect: Conn
 
     async with connect(server) as client:
         result = await client.call_tool("download", {}, progress_callback=collect)
+        # Captured at return time: all three notifications were delivered before call_tool returned.
+        received_at_return = list(received)
 
     assert result == snapshot(CallToolResult(content=[TextContent(text="downloaded")]))
-    assert received == snapshot([(1.0, 3.0, "first chunk"), (2.0, 3.0, "second chunk"), (3.0, 3.0, "done")])
+    assert received_at_return == snapshot([(1.0, 3.0, "first chunk"), (2.0, 3.0, "second chunk"), (3.0, 3.0, "done")])
+    assert received == received_at_return  # nothing arrived after the call returned
 
 
 @requirement("protocol:progress:token-injected")

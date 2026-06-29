@@ -8,8 +8,17 @@ streamable HTTP, so plain-list collection is deterministic on every transport le
 import mcp_types as types
 import pytest
 from inline_snapshot import snapshot
-from mcp_types import CallToolResult, EmptyResult, LoggingMessageNotificationParams, TextContent
+from mcp_types import (
+    INVALID_PARAMS,
+    LOG_LEVEL_META_KEY,
+    CallToolResult,
+    EmptyResult,
+    ErrorData,
+    LoggingMessageNotificationParams,
+    TextContent,
+)
 
+from mcp import MCPError
 from mcp.server import Server, ServerRequestContext
 from tests.interaction._connect import Connect
 from tests.interaction._requirements import requirement
@@ -82,14 +91,17 @@ async def test_log_messages_reach_logging_callback_in_order(connect: Connect) ->
 
     async with connect(server, logging_callback=collect) as client:
         result = await client.call_tool("chatty", {})
+        # Captured at return time: both messages were delivered before call_tool returned.
+        received_at_return = list(received)
 
     assert result == snapshot(CallToolResult(content=[TextContent(text="done")]))
-    assert received == snapshot(
+    assert received_at_return == snapshot(
         [
             LoggingMessageNotificationParams(level="info", logger="app.lifecycle", data="starting up"),
             LoggingMessageNotificationParams(level="error", data={"code": 502, "retryable": True}),
         ]
     )
+    assert received == received_at_return  # nothing arrived after the call returned
 
 
 @requirement("logging:message:all-levels")
@@ -125,3 +137,86 @@ async def test_log_messages_at_every_severity_level(connect: Connect) -> None:
         await client.call_tool("siren", {})
 
     assert [params.level for params in received] == list(ALL_LEVELS)
+
+
+@requirement("logging:message:filtered")
+async def test_lowlevel_server_delivers_messages_below_the_requested_level(connect: Connect) -> None:
+    """After logging/setLevel("error"), a debug message still reaches the client's callback.
+
+    Pinned divergence (the low-level half of the note on `logging:message:filtered`): the
+    low-level Server leaves filtering entirely to the author's setLevel handler, so an
+    acknowledge-only handler filters nothing and every severity is delivered.
+    """
+    received: list[LoggingMessageNotificationParams] = []
+    levels: list[types.LoggingLevel] = []
+
+    async def collect(params: LoggingMessageNotificationParams) -> None:
+        received.append(params)
+
+    async def set_logging_level(ctx: ServerRequestContext, params: types.SetLevelRequestParams) -> EmptyResult:
+        levels.append(params.level)
+        return EmptyResult()
+
+    async def list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(tools=[types.Tool(name="chatty", input_schema={"type": "object"})])
+
+    async def call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams) -> CallToolResult:
+        assert params.name == "chatty"
+        await ctx.session.send_log_message(  # pyright: ignore[reportDeprecated]
+            level="debug", data="below the level", related_request_id=ctx.request_id
+        )
+        await ctx.session.send_log_message(  # pyright: ignore[reportDeprecated]
+            level="error", data="at the level", related_request_id=ctx.request_id
+        )
+        return CallToolResult(content=[TextContent(text="done")])
+
+    server = Server(  # pyright: ignore[reportDeprecated]
+        "logger", on_list_tools=list_tools, on_call_tool=call_tool, on_set_logging_level=set_logging_level
+    )
+
+    async with connect(server, logging_callback=collect) as client:
+        await client.set_logging_level("error")  # pyright: ignore[reportDeprecated]
+        await client.call_tool("chatty", {})
+
+    # Dispatch identity: the level reached the author's handler before the tool ran.
+    assert levels == ["error"]
+    assert received == snapshot(
+        [
+            LoggingMessageNotificationParams(level="debug", data="below the level"),
+            LoggingMessageNotificationParams(level="error", data="at the level"),
+        ]
+    )
+
+
+@requirement("logging:per-request-level:invalid-level")
+async def test_unrecognized_per_request_log_level_is_rejected_with_invalid_params(connect: Connect) -> None:
+    """A request whose _meta carries an unrecognized io.modelcontextprotocol/logLevel fails with -32602.
+
+    Spec-mandated (2026-07-28 logging error handling, a SHOULD the SDK honours). The rejection is
+    the per-version surface validation and fires before the tool handler; the same call with a
+    recognized level succeeds, proving the level value is what was rejected. The error message is
+    the SDK's own surface-validation output.
+    """
+
+    async def list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(tools=[types.Tool(name="echo", input_schema={"type": "object"})])
+
+    async def call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams) -> CallToolResult:
+        assert params.name == "echo"
+        return CallToolResult(content=[TextContent(text="ok")])
+
+    server = Server("strict", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    async with connect(server) as client:
+        accepted = await client.call_tool("echo", {}, meta={LOG_LEVEL_META_KEY: "warning"})
+        with pytest.raises(MCPError) as exc_info:
+            await client.call_tool("echo", {}, meta={LOG_LEVEL_META_KEY: "verbose"})
+
+    assert accepted == snapshot(CallToolResult(content=[TextContent(text="ok")]))
+    assert exc_info.value.error == snapshot(
+        ErrorData(code=INVALID_PARAMS, message="Invalid request parameters", data="")
+    )

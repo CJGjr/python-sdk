@@ -130,6 +130,31 @@ async def test_read_unknown_uri_is_error(connect: Connect) -> None:
     )
 
 
+@requirement("resources:read:unknown-uri-32002")
+async def test_read_unknown_uri_on_a_2025_session_fails_with_32602_not_32002(connect: Connect) -> None:
+    """Reading a URI that matches no registered resource on a 2025-11-25 session fails with -32602
+    and the URI in data.
+
+    Pins a known divergence: the 2025-11-25 revision recommends -32002 (resource not found), but
+    MCPServer's ResourceNotFoundError mapping is era-independent, so the SEP-2164 code -32602 is
+    returned on legacy sessions too.
+    """
+    mcp = MCPServer("library")
+
+    @mcp.resource("config://app")
+    def app_config() -> str:
+        """A registered resource; the test reads a different URI."""
+        raise NotImplementedError
+
+    async with connect(mcp) as client:
+        with pytest.raises(MCPError) as exc_info:
+            await client.read_resource("config://missing")
+
+    assert exc_info.value.error == snapshot(
+        ErrorData(code=-32602, message="Unknown resource: config://missing", data={"uri": "config://missing"})
+    )
+
+
 @requirement("mcpserver:resource:read-throws-surfaced")
 async def test_resource_function_that_raises_is_surfaced_as_a_jsonrpc_error(connect: Connect) -> None:
     """An exception raised by a resource function reaches the caller as a JSON-RPC error.

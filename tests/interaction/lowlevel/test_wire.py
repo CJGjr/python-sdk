@@ -6,8 +6,9 @@ the transport seam into a list without touching the session, so the assertions h
 the session implementation sends rather than for what its API returns.
 
 The later tests drive the wire by hand instead: one closes the server-to-client stream while a
-request is in flight to pin the connection-closed teardown, and the last two send deliberately
-malformed JSON-RPC requests that the typed client API cannot produce.
+request is in flight to pin the connection-closed teardown, two send deliberately malformed
+JSON-RPC requests that the typed client API cannot produce, and the last scripts the server's
+side to ship a malformed result body that no real Server can emit.
 """
 
 import anyio
@@ -22,20 +23,24 @@ from mcp_types import (
     CallToolResult,
     EmptyResult,
     ErrorData,
+    Implementation,
+    InitializeResult,
     JSONRPCError,
     JSONRPCNotification,
     JSONRPCRequest,
     JSONRPCResponse,
     ListRootsResult,
+    ServerCapabilities,
     TextContent,
 )
+from pydantic import ValidationError
 
 from mcp import MCPError
 from mcp.client import ClientRequestContext, ClientSession
 from mcp.client._memory import InMemoryTransport
 from mcp.client.client import Client
 from mcp.server import Server, ServerRequestContext
-from mcp.shared.memory import create_client_server_memory_streams
+from mcp.shared.memory import MessageStream, create_client_server_memory_streams
 from mcp.shared.message import SessionMessage
 from tests.interaction._helpers import RecordingTransport, _RecordingReadStream
 from tests.interaction._requirements import requirement
@@ -308,3 +313,60 @@ async def test_set_level_with_an_unrecognized_value_is_answered_with_invalid_par
 
     assert len(errors) == 1
     assert errors[0].code == INVALID_PARAMS
+
+
+@requirement("protocol:result-validation:invalid-result-sdkerror")
+async def test_malformed_result_body_raises_a_validation_error_instead_of_resolving() -> None:
+    """PINS A KNOWN GAP: a result body that fails the expected result shape raises a raw
+    pydantic.ValidationError out of the request instead of a typed SDK error (see the
+    requirement's divergence); rejecting rather than resolving is the contract under test.
+
+    The test plays the server by hand over memory streams because a real Server cannot ship a
+    malformed spec result -- its runner refuses to serialize one and answers INTERNAL_ERROR
+    instead (src/mcp/server/runner.py).
+    """
+
+    async def scripted_server(streams: MessageStream) -> None:
+        server_read, server_write = streams
+
+        def respond(request_id: types.RequestId, result: dict[str, object]) -> SessionMessage:
+            return SessionMessage(JSONRPCResponse(jsonrpc="2.0", id=request_id, result=result))
+
+        init = await server_read.receive()
+        assert isinstance(init, SessionMessage)
+        assert isinstance(init.message, JSONRPCRequest)
+        assert init.message.method == "initialize"
+        await server_write.send(
+            respond(
+                init.message.id,
+                InitializeResult(
+                    protocol_version="2025-11-25",
+                    capabilities=ServerCapabilities(),
+                    server_info=Implementation(name="scripted", version="0.0.1"),
+                ).model_dump(by_alias=True, mode="json", exclude_none=True),
+            )
+        )
+
+        initialized = await server_read.receive()
+        assert isinstance(initialized, SessionMessage)
+        assert isinstance(initialized.message, JSONRPCNotification)
+        assert initialized.message.method == "notifications/initialized"
+
+        call = await server_read.receive()
+        assert isinstance(call, SessionMessage)
+        assert isinstance(call.message, JSONRPCRequest)
+        assert call.message.method == "tools/list"
+        # "tools" must be an array of Tool objects; a string is the malformed shape under test.
+        await server_write.send(respond(call.message.id, {"tools": "nope"}))
+
+    async with (
+        create_client_server_memory_streams() as ((client_read, client_write), server_streams),
+        anyio.create_task_group() as task_group,
+        ClientSession(client_read, client_write) as session,
+    ):
+        task_group.start_soon(scripted_server, server_streams)
+        with anyio.fail_after(5):
+            await session.initialize()
+            # Only the exception type is pinned -- the message is pydantic's own third-party output.
+            with pytest.raises(ValidationError):  # pragma: no branch
+                await session.list_tools()

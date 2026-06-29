@@ -2,8 +2,9 @@
 
 The ``connect`` fixture is parametrized per-test from the ``@requirement`` marks the test
 carries: ``pytest_generate_tests`` looks up each cited requirement in the manifest and computes
-the (transport, spec_version) cells via :func:`compute_cells`, applying arm exclusions, version
-bounds, and known-failure xfails declaratively.
+the (transport, spec_version) cells via :func:`cells_for_test`, applying arm exclusions, version
+bounds, and known-failure xfails declaratively. A test whose stacked requirements intersect to
+zero cells fails collection instead of silently skipping.
 """
 
 from functools import partial
@@ -17,7 +18,7 @@ from tests.interaction._connect import (
     connect_over_streamable_http,
     connect_over_streamable_http_stateless,
 )
-from tests.interaction._requirements import REQUIREMENTS, compute_cells
+from tests.interaction._requirements import cells_for_test
 
 _FACTORIES: dict[str, Connect] = {
     "in-memory": connect_in_memory,
@@ -31,8 +32,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     """Parametrize ``connect`` from the test's stacked ``@requirement`` marks."""
     if "connect" not in metafunc.fixturenames:
         return
-    requirements = [REQUIREMENTS[mark.args[0]] for mark in metafunc.definition.iter_markers("requirement")]
-    metafunc.parametrize("connect", compute_cells(requirements), indirect=True)
+    requirement_ids = [mark.args[0] for mark in metafunc.definition.iter_markers("requirement")]
+    metafunc.parametrize("connect", cells_for_test(metafunc.definition.nodeid, requirement_ids), indirect=True)
 
 
 @pytest.fixture

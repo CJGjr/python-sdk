@@ -8,7 +8,9 @@ elsewhere in the repo must point at paths that exist. Test modules are imported 
 """
 
 import importlib
+import inspect
 import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import cast
@@ -24,11 +26,13 @@ from tests.interaction._requirements import (
     SPEC_BASE_URL,
     SPEC_VERSIONS,
     ArmExclusion,
+    Divergence,
     KnownFailure,
     Requirement,
     SpecVersion,
     Transport,
     cell_id,
+    cells_for_test,
     compute_cells,
     covered_by,
     requirement,
@@ -205,6 +209,12 @@ def test_invalid_requirement_source_is_rejected() -> None:
         Requirement(source="https://example.com/not-the-spec", behavior="Never constructed.")
 
 
+def test_requirement_with_malformed_issue_is_rejected() -> None:
+    """A requirement whose issue reference is neither '#<n>' nor a GitHub URL fails at construction."""
+    with pytest.raises(ValueError, match="must be '#<n>' or a GitHub URL"):
+        Requirement(source="sdk", behavior="x", issue="not-a-link")
+
+
 def test_arm_exclusion_with_unknown_spec_version_is_rejected() -> None:
     """An arm exclusion naming a spec version outside KNOWN_PROTOCOL_VERSIONS fails at construction."""
     with pytest.raises(ValueError, match="is not in KNOWN_PROTOCOL_VERSIONS"):
@@ -227,6 +237,12 @@ def test_known_failure_with_malformed_issue_is_rejected() -> None:
     """A known failure whose issue reference is neither '#<n>' nor a GitHub URL fails at construction."""
     with pytest.raises(ValueError, match="must be '#<n>' or a GitHub URL"):
         KnownFailure(note="x", issue="not-a-link")
+
+
+def test_divergence_with_malformed_issue_is_rejected() -> None:
+    """A divergence whose issue reference is neither '#<n>' nor a GitHub URL fails at construction."""
+    with pytest.raises(ValueError, match="must be '#<n>' or a GitHub URL"):
+        Divergence(note="x", issue="not-a-link")
 
 
 def test_requirement_with_unknown_added_in_is_rejected() -> None:
@@ -254,6 +270,7 @@ def _req(
     transports: tuple[Transport, ...] | None = None,
     arm_exclusions: tuple[ArmExclusion, ...] = (),
     known_failures: tuple[KnownFailure, ...] = (),
+    deferred: str | None = None,
 ) -> Requirement:
     """Build a synthetic Requirement for compute_cells() unit tests."""
     return Requirement(
@@ -264,6 +281,7 @@ def _req(
         transports=transports,
         arm_exclusions=arm_exclusions,
         known_failures=known_failures,
+        deferred=deferred,
     )
 
 
@@ -350,6 +368,24 @@ def test_compute_cells_ignores_transports_field() -> None:
     assert [c.id for c in cells] == list(CONNECTABLE_TRANSPORTS)
 
 
+def test_cells_for_test_passes_the_computed_grid_through() -> None:
+    """With at least one surviving cell, cells_for_test returns compute_cells' grid for the cited ids unchanged."""
+    cells = cells_for_test("tests/x.py::test_x", ["r"], requirements={"r": _req()})
+    assert [c.id for c in cells] == [c.id for c in compute_cells([_req()])]
+
+
+def test_cells_for_test_rejects_a_stack_that_admits_no_cell() -> None:
+    """A connect test whose stacked requirements intersect to zero matrix cells is rejected with the
+    test's id and the cited requirement ids, turning a silent empty-parameter-set skip into a
+    collection error."""
+    excluded = _req(arm_exclusions=(ArmExclusion(reason="requires-session"),))
+    with pytest.raises(
+        ValueError,
+        match=r"tests/x\.py::test_x admits no \(transport, spec_version\) cell: the stacked requirements \['r'\]",
+    ):
+        cells_for_test("tests/x.py::test_x", ["r"], requirements={"r": excluded})
+
+
 def test_cell_id_omits_version_when_single_spec_version() -> None:
     """With a single-version axis the cell id is just the transport name."""
     assert cell_id("sse", "2025-11-25", spec_versions=("2025-11-25",)) == "sse"
@@ -358,3 +394,118 @@ def test_cell_id_omits_version_when_single_spec_version() -> None:
 def test_cell_id_appends_version_when_multiple_spec_versions() -> None:
     """With more than one active spec version the cell id gains a -<version> suffix."""
     assert cell_id("sse", "2025-11-25", spec_versions=("2025-11-25", "2026-07-28")) == "sse-2025-11-25"
+
+
+def _cell_set(requirements: Sequence[Requirement]) -> set[tuple[Transport, SpecVersion]]:
+    """The (transport, spec_version) cells compute_cells emits for these stacked requirements."""
+    return {cell.values[0] for cell in compute_cells(requirements)}
+
+
+def _unexercised_cells(
+    requirements: Mapping[str, Requirement],
+    coverage: Mapping[str, Sequence[str]],
+    cells_by_test: Mapping[str, set[tuple[Transport, SpecVersion]] | None],
+) -> list[str]:
+    """Cells a non-deferred requirement's own grid admits that no covering test runs.
+
+    `cells_by_test` maps each covering test to the cells it is parametrized over, or None for a
+    test that does not use the connect fixture; such a test runs unparametrized, so it counts
+    for every cell the requirement admits.
+    """
+    missing: list[str] = []
+    for requirement_id, spec in sorted(requirements.items()):
+        if spec.deferred is not None:
+            continue
+        required = _cell_set([spec])
+        exercised: set[tuple[Transport, SpecVersion]] = set()
+        for test_name in coverage[requirement_id]:
+            cells = cells_by_test[test_name]
+            exercised |= required if cells is None else cells
+        missing += [
+            f"{requirement_id} @ {cell_id(transport, version)}" for transport, version in sorted(required - exercised)
+        ]
+    return missing
+
+
+def test_every_admitted_matrix_cell_is_exercised() -> None:
+    """Each (transport, spec_version) cell a non-deferred requirement's own grid admits is run by
+    at least one covering test, so a version- or transport-bounded mark stacked onto a shared test
+    cannot silently strip cells from the other requirements that test covers."""
+    cells_by_test: dict[str, set[tuple[Transport, SpecVersion]] | None] = {}
+    for module in _import_all_test_modules():
+        for name, fn in vars(module).items():
+            if not name.startswith("test_"):
+                continue
+            stacked = [mark.args[0] for mark in getattr(fn, "pytestmark", []) if mark.name == "requirement"]
+            if not stacked:
+                continue
+            uses_connect = "connect" in inspect.signature(fn).parameters
+            cells_by_test[f"{module.__name__}.{name}"] = (
+                _cell_set([REQUIREMENTS[requirement_id] for requirement_id in stacked]) if uses_connect else None
+            )
+    coverage = {requirement_id: covered_by(requirement_id) for requirement_id in REQUIREMENTS}
+    missing = _unexercised_cells(REQUIREMENTS, coverage, cells_by_test)
+    assert not missing, f"Requirements with an admitted matrix cell no test runs: {missing}"
+
+
+def test_unexercised_cells_reports_an_era_stripped_by_a_stacked_mark() -> None:
+    """Stacking a version-bounded requirement onto the only test covering an era-spanning one
+    strips the newer era's cells from the intersection; the checker reports every stripped cell."""
+    spanning = _req()
+    bounded = _req(removed_in="2026-07-28")
+    missing = _unexercised_cells(
+        {"spanning": spanning, "bounded": bounded},
+        {"spanning": ["test_t"], "bounded": ["test_t"]},
+        {"test_t": _cell_set([spanning, bounded])},
+    )
+    assert missing == ["spanning @ in-memory-2026-07-28", "spanning @ streamable-http-2026-07-28"]
+
+
+def test_unexercised_cells_reports_a_transport_stripped_by_a_stacked_exclusion() -> None:
+    """Stacking an arm-excluded requirement onto a shared test strips the excluded transport's
+    cell from the other requirement, which carries no such exclusion; the checker reports it."""
+    plain = _req()
+    needs_session = _req(
+        arm_exclusions=(ArmExclusion(reason="requires-session", transport="streamable-http-stateless"),)
+    )
+    missing = _unexercised_cells(
+        {"plain": plain, "needs-session": needs_session},
+        {"plain": ["test_t"], "needs-session": ["test_t"]},
+        {"test_t": _cell_set([plain, needs_session])},
+    )
+    assert missing == ["plain @ streamable-http-stateless-2025-11-25"]
+
+
+def test_unexercised_cells_accepts_coverage_split_across_tests() -> None:
+    """A requirement's cells may be covered by different tests; the checker unions the cells
+    across all covering tests before comparing against the requirement's own grid."""
+    spanning = _req()
+    legacy = _req(removed_in="2026-07-28")
+    modern = _req(added_in="2026-07-28")
+    missing = _unexercised_cells(
+        {"spanning": spanning, "legacy": legacy, "modern": modern},
+        {"spanning": ["test_old", "test_new"], "legacy": ["test_old"], "modern": ["test_new"]},
+        {"test_old": _cell_set([spanning, legacy]), "test_new": _cell_set([spanning, modern])},
+    )
+    assert missing == []
+
+
+def test_unexercised_cells_counts_a_non_connect_test_for_every_cell() -> None:
+    """A covering test that does not use the connect fixture runs unparametrized -- no stacked
+    mark can strip its cells -- so it satisfies every cell its requirement admits."""
+    missing = _unexercised_cells({"r": _req()}, {"r": ["test_direct"]}, {"test_direct": None})
+    assert missing == []
+
+
+def test_unexercised_cells_skips_deferred_requirements() -> None:
+    """Deferred requirements have no tests by contract, so the per-cell check demands nothing of them."""
+    deferred = _req(deferred="Not implemented in the SDK: synthetic entry for this checker test.")
+    assert _unexercised_cells({"r": deferred}, {}, {}) == []
+
+
+def test_unexercised_cells_respects_the_requirements_own_exclusions() -> None:
+    """A cell the requirement excludes for itself is not demanded: required cells come from the
+    requirement's own grid, the same computation that parametrizes its tests."""
+    scoped = _req(arm_exclusions=(ArmExclusion(reason="asserts-legacy-handshake", spec_version="2026-07-28"),))
+    missing = _unexercised_cells({"r": scoped}, {"r": ["test_t"]}, {"test_t": _cell_set([scoped])})
+    assert missing == []

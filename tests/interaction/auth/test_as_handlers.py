@@ -308,11 +308,12 @@ async def test_register_echoes_native_for_a_client_that_registered_application_t
     """A client registering `application_type: "web"` is told `"native"` in the registration echo.
 
     Pins the known gap recorded on the requirement (divergence): the registration handler's
-    field-by-field passthrough omits `application_type`, so the model default fills the echo
-    where RFC 7591 §3.2.1 requires the registered value -- and the SDK OAuth client adopts the
-    echo into persisted storage, so the corruption is client-visible end to end. When the
-    one-line passthrough fix lands this test fails: re-pin the echo to `"web"`, delete the
-    Divergence, and add the echo assertion to
+    field-by-field passthrough omits `application_type`, so the model default replaces the
+    submitted value in the stored record and the echo alike -- wire-legal under RFC 7591 (a
+    server may replace requested metadata values), but an accident of the field list rather
+    than a policy, and the SDK OAuth client adopts the echo into persisted storage, so the
+    corruption is client-visible end to end. When the one-line passthrough fix lands this test
+    fails: re-pin the echo to `"web"`, delete the Divergence, and add the echo assertion to
     `test_dcr_sends_a_consumer_set_application_type_verbatim` (test_flow.py) per the
     requirement's note.
     """

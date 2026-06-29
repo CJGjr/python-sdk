@@ -1,7 +1,8 @@
 """Form- and URL-mode elicitation against the low-level Server, driven through the public Client API.
 
-The final test plays the server's side of the wire by hand to issue an elicitation request with no
-mode field, because the typed server API (`elicit_form`/`elicit_url`) always serializes one.
+Two tests play the server's side of the wire by hand to issue an elicitation request with no mode
+field — one per era vehicle (the 2025 push request, the 2026 MRTR embed) — because the typed
+params model always serializes a mode.
 """
 
 import anyio
@@ -11,6 +12,7 @@ from inline_snapshot import snapshot
 from mcp_types import (
     URL_ELICITATION_REQUIRED,
     CallToolResult,
+    DiscoverResult,
     ElicitCompleteNotification,
     ElicitCompleteNotificationParams,
     ElicitRequest,
@@ -540,15 +542,16 @@ async def test_accepted_elicitation_content_that_violates_the_schema_reaches_the
 
     server = Server("registrar", on_list_tools=list_tools, on_call_tool=call_tool)
 
+    violating_content: dict[str, str | int | float | bool | list[str] | None] = {"name": 42, "extra": "field"}
+
     async def answer_form(context: ClientRequestContext, params: types.ElicitRequestParams) -> ElicitResult:
-        return ElicitResult(action="accept", content={"name": 42, "extra": "field"})
+        return ElicitResult(action="accept", content=violating_content)
 
     async with connect(server, elicitation_callback=answer_form) as client:
         result = await client.call_tool("signup", {})
 
-    assert result == snapshot(
-        CallToolResult(content=[TextContent(text="accept")], structured_content={"name": 42, "extra": "field"})
-    )
+    assert result.content == snapshot([TextContent(text="accept")])
+    assert result.structured_content == violating_content
 
 
 @requirement("elicitation:url:complete-unknown-ignored")
@@ -901,6 +904,63 @@ async def test_embedded_form_elicitation_schema_primitives_reach_the_callback_as
     )
 
 
+@requirement("elicitation:mrtr:form:response-validation")
+async def test_embedded_elicitation_content_that_violates_the_schema_reaches_the_retried_handler_unchanged(
+    connect: Connect,
+) -> None:
+    """Accepted content for an embedded form elicitation that contradicts the requested schema
+    reaches the retried handler unchanged in inputResponses.
+
+    The schema requires a string `name`; the callback answers with a wrong-type value and an
+    extra field. Neither the client driver nor the server validates the content against the
+    requested schema (see the divergence on the requirement), so the structurally valid but
+    schema-violating ElicitResult crosses both halves intact.
+    """
+
+    async def list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(
+            tools=[types.Tool(name="signup", description="Register the user.", input_schema={"type": "object"})]
+        )
+
+    async def call_tool(
+        ctx: ServerRequestContext, params: types.CallToolRequestParams
+    ) -> CallToolResult | InputRequiredResult:
+        assert params.name == "signup"
+        if not params.input_responses:
+            return InputRequiredResult(
+                input_requests={
+                    "signup": ElicitRequest(
+                        params=ElicitRequestFormParams(
+                            message="Choose a name.",
+                            requested_schema={
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}},
+                                "required": ["name"],
+                            },
+                        )
+                    )
+                }
+            )
+        answer = params.input_responses["signup"]
+        assert isinstance(answer, ElicitResult)
+        return CallToolResult(content=[TextContent(text=answer.action)], structured_content=answer.content)
+
+    server = Server("registrar", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    violating_content: dict[str, str | int | float | bool | list[str] | None] = {"name": 42, "extra": "field"}
+
+    async def answer_form(context: ClientRequestContext, params: types.ElicitRequestParams) -> ElicitResult:
+        return ElicitResult(action="accept", content=violating_content)
+
+    async with connect(server, elicitation_callback=answer_form) as client:
+        result = await client.call_tool("signup", {})
+
+    assert result.content == snapshot([TextContent(text="accept")])
+    assert result.structured_content == violating_content
+
+
 @requirement("elicitation:mrtr:capability:not-declared")
 async def test_server_embeds_elicitation_for_a_client_that_declared_no_elicitation_capability(
     connect: Connect,
@@ -947,6 +1007,83 @@ async def test_server_embeds_elicitation_for_a_client_that_declared_no_elicitati
             }
         )
     )
+
+
+@requirement("elicitation:mrtr:form:mode-omitted-default")
+async def test_a_mode_less_embedded_elicitation_request_is_treated_as_form_mode() -> None:
+    """An embedded elicitation/create whose params carry no mode field surfaces to the client as
+    form mode (spec MUST, kept for backwards compatibility at 2026-07-28 where elicitation rides
+    MRTR inputRequests).
+
+    The test plays the server by hand over memory streams against a pinned-2026 ClientSession:
+    `ElicitRequestFormParams` always fills and serializes mode="form", so no typed server can emit
+    a mode-less embed -- only a byte-controlled result body can carry the absence. The manual
+    allow_input_required surface exposes the decoded embed; past this decode the params are
+    type-identical to an explicit form-mode embed, whose callback delivery
+    elicitation:mrtr:form:basic pins.
+    """
+
+    async def scripted_server(streams: MessageStream) -> None:
+        server_read, server_write = streams
+        call = await server_read.receive()
+        assert isinstance(call, SessionMessage)
+        assert isinstance(call.message, JSONRPCRequest)
+        assert call.message.method == "tools/call"
+        # Deliberately no "mode" key in the embedded params: the absence is the clause under test.
+        await server_write.send(
+            SessionMessage(
+                JSONRPCResponse(
+                    jsonrpc="2.0",
+                    id=call.message.id,
+                    result={
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "ask": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "message": "Mode-less ask.",
+                                    "requestedSchema": {"type": "object", "properties": {}},
+                                },
+                            }
+                        },
+                    },
+                )
+            )
+        )
+
+    async with (
+        create_client_server_memory_streams() as ((client_read, client_write), server_streams),
+        anyio.create_task_group() as task_group,
+        ClientSession(client_read, client_write) as session,
+    ):
+        task_group.start_soon(scripted_server, server_streams)
+        session.adopt(
+            DiscoverResult(
+                supported_versions=[LATEST_MODERN_VERSION],
+                capabilities=ServerCapabilities(),
+                server_info=Implementation(name="srv", version="0"),
+            )
+        )
+        with anyio.fail_after(5):
+            raw = await session.call_tool("ask", {}, allow_input_required=True)
+
+        assert isinstance(raw, InputRequiredResult)
+        assert raw == snapshot(
+            InputRequiredResult(
+                input_requests={
+                    "ask": ElicitRequest(
+                        params=ElicitRequestFormParams(
+                            message="Mode-less ask.", requested_schema={"type": "object", "properties": {}}
+                        )
+                    )
+                }
+            )
+        )
+        assert raw.input_requests is not None
+        request = raw.input_requests["ask"]
+        assert isinstance(request, ElicitRequest)
+        assert isinstance(request.params, ElicitRequestFormParams)
+        assert request.params.mode == "form"
 
 
 @requirement("mrtr:url-elicitation:no-32042-on-2026")

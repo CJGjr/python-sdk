@@ -163,6 +163,8 @@ async def test_a_legacy_range_error_code_reaches_the_caller_verbatim_without_int
         with pytest.raises(MCPError) as exc_info:
             await client.call_tool("vendor", {})
 
+    # Exact type, not isinstance: pytest.raises alone would accept a code-keyed MCPError subclass.
+    assert type(exc_info.value) is MCPError
     assert exc_info.value.error == snapshot(
         ErrorData(code=-32011, message="vendor-specific failure", data={"hint": "opaque"})
     )

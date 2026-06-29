@@ -42,10 +42,13 @@ pytestmark = pytest.mark.anyio
 
 
 @requirement("sampling:create:basic")
+@requirement("sampling:message:content-cardinality")
 @requirement("tools:call:sampling-roundtrip")
 async def test_create_message_round_trip(connect: Connect) -> None:
     """A handler's sampling request is answered by the client callback, and the callback's result
-    (role, content, model, stop reason) is returned to the handler.
+    (role, content, model, stop reason) is returned to the handler. The single-block message
+    content also pins the scalar half of sampling:message:content-cardinality (the list half has
+    its own test).
     """
     received: list[CreateMessageRequestParams] = []
 
@@ -61,7 +64,9 @@ async def test_create_message_round_trip(connect: Connect) -> None:
             max_tokens=100,
         )
         assert isinstance(result.content, TextContent)
-        return CallToolResult(content=[TextContent(text=f"{result.model}/{result.stop_reason}: {result.content.text}")])
+        return CallToolResult(
+            content=[TextContent(text=f"{result.role}/{result.model}/{result.stop_reason}: {result.content.text}")]
+        )
 
     server = Server("sampler", on_list_tools=list_tools, on_call_tool=call_tool)
 
@@ -79,7 +84,9 @@ async def test_create_message_round_trip(connect: Connect) -> None:
     async with connect(server, sampling_callback=sampling_callback) as client:
         result = await client.call_tool("ask_model", {})
 
-    assert result == snapshot(CallToolResult(content=[TextContent(text="mock-llm-1/endTurn: Hello to you too.")]))
+    assert result == snapshot(
+        CallToolResult(content=[TextContent(text="assistant/mock-llm-1/endTurn: Hello to you too.")])
+    )
     assert received == snapshot(
         [
             CreateMessageRequestParams(
@@ -407,6 +414,55 @@ async def test_create_message_with_mixed_tool_result_content_is_rejected(connect
             ]
         )
     )
+
+
+@requirement("sampling:tool-result:no-mixed-content")
+async def test_mixed_tool_result_content_in_an_earlier_message_is_not_rejected(connect: Connect) -> None:
+    """A user message mixing tool_result with text is accepted when it is not the final message.
+
+    Pinned divergence: the spec's only-tool_result MUST covers every user message, but the SDK
+    validates only the final one, so the earlier mixed message reaches the client callback
+    unrejected.
+    """
+    mixed = SamplingMessage(
+        role="user",
+        content=[
+            ToolResultContent(tool_use_id="call-1", content=[TextContent(text="42")]),
+            TextContent(text="Also, a comment alongside the result."),
+        ],
+    )
+    sent = [
+        mixed,
+        SamplingMessage(role="assistant", content=TextContent(text="Noted.")),
+        SamplingMessage(role="user", content=TextContent(text="Summarise.")),
+    ]
+    received: list[CreateMessageRequestParams] = []
+
+    async def list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(tools=[types.Tool(name="summarise", input_schema={"type": "object"})])
+
+    async def call_tool(ctx: ServerRequestContext, params: types.CallToolRequestParams) -> CallToolResult:
+        assert params.name == "summarise"
+        result = await ctx.session.create_message(messages=sent, max_tokens=100)  # pyright: ignore[reportDeprecated]
+        assert isinstance(result.content, TextContent)
+        return CallToolResult(content=[TextContent(text=result.content.text)])
+
+    server = Server("sampler", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    async def sampling_callback(
+        context: ClientRequestContext, params: CreateMessageRequestParams
+    ) -> CreateMessageResult:
+        received.append(params)
+        return CreateMessageResult(role="assistant", content=TextContent(text="ok"), model="mock-llm-1")
+
+    async with connect(server, sampling_callback=sampling_callback) as client:
+        result = await client.call_tool("summarise", {})
+
+    assert result == snapshot(CallToolResult(content=[TextContent(text="ok")]))
+    # Pass-through rule: the callback received exactly the messages the handler sent.
+    assert [p.messages for p in received] == [sent]
 
 
 @requirement("sampling:capability:declare")

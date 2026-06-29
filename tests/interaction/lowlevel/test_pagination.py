@@ -58,7 +58,7 @@ async def test_next_cursor_round_trips_through_the_client(connect: Connect) -> N
     assert second_page == snapshot(ListToolsResult(tools=[Tool(name="beta", input_schema={"type": "object"})]))
 
 
-@requirement("protocol:pagination:empty-cursor-valid")
+@requirement("pagination:client:empty-cursor-valid")
 async def test_an_empty_string_next_cursor_round_trips_as_a_cursor_not_end_of_results(connect: Connect) -> None:
     """An empty-string next_cursor is surfaced as "" -- distinct from absent -- and passes back verbatim as a cursor.
 

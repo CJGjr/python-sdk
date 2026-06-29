@@ -63,6 +63,7 @@ from mcp.client.client import Client
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import Server, ServerRequestContext
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import NoBackChannelError
 from tests.interaction._connect import (
     BASE_URL,
@@ -214,6 +215,89 @@ async def test_legacy_version_header_falls_through_and_unrecognised_header_route
     assert JSONRPCError.model_validate_json(unrecognised.text).error.code == INVALID_PARAMS
 
 
+@requirement("hosting:http:modern:dns-rebinding")
+async def test_modern_origin_validation_rejects_disallowed_origins_only_when_enabled() -> None:
+    """A disallowed Origin on a 2026-07-28 POST returns 403 with protection enabled; disabled lets it through.
+
+    Spec-mandated for the 403: the draft transport's Origin validation is an unconditional MUST
+    with a 403 Forbidden rejection (whose body may be plain text -- the JSON-RPC error body is a
+    spec MAY). The disabled arm pins the divergence on the requirement: the modern entry shares
+    the legacy path's security middleware, so with protection off the same Origin is served. The
+    allowed-Origin arm proves the 403 comes from Origin validation, not another gate.
+    """
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "add", "arguments": {"a": 2, "b": 3}, "_meta": _meta_envelope()},
+    }
+    headers = _modern_headers(method="tools/call", name="add")
+    # transport_security=None triggers the localhost auto-enable behaviour.
+    async with mounted_app(_server(), transport_security=None) as (http, _):
+        bad_origin = await http.post("/mcp", json=body, headers=headers | {"origin": "http://evil.example"})
+        allowed = await http.post("/mcp", json=body, headers=headers | {"origin": "http://127.0.0.1:8000"})
+
+    assert (bad_origin.status_code, bad_origin.text) == snapshot((403, "Invalid Origin header"))
+    assert allowed.status_code == 200
+
+    async with mounted_app(
+        _server(), transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    ) as (http, _):
+        unguarded = await http.post("/mcp", json=body, headers=headers | {"origin": "http://evil.example"})
+
+    assert unguarded.status_code == 200
+
+
+@requirement("hosting:http:modern:method-405")
+async def test_modern_stamped_get_and_delete_return_405_with_allow_post() -> None:
+    """A GET or DELETE carrying a 2026-07-28 MCP-Protocol-Version header returns 405 with Allow: POST.
+
+    SDK-defined: the draft transport defines the MCP endpoint as POST-only and mandates no status
+    for a modern-stamped non-POST. The Allow value pins that the rejection comes from the modern
+    entry, not the legacy machinery -- the legacy 405 advertises GET, POST, DELETE, and the legacy
+    path would have served the GET as a standalone SSE stream and the DELETE as session
+    termination. Asserted at the wire because 405 is an HTTP status code.
+    """
+    async with mounted_app(_server()) as (http, _):
+        get = await http.get("/mcp", headers={"mcp-protocol-version": LATEST_MODERN_VERSION})
+        delete = await http.delete("/mcp", headers={"mcp-protocol-version": LATEST_MODERN_VERSION})
+
+    assert (get.status_code, get.headers.get("allow")) == snapshot((405, "POST"))
+    assert (delete.status_code, delete.headers.get("allow")) == snapshot((405, "POST"))
+
+
+@requirement("hosting:http:modern:accept-406")
+async def test_modern_accept_lacking_a_required_type_is_406_with_json_mode_relaxation() -> None:
+    """A 2026-07-28 POST missing a required Accept type is 406 with an empty body; JSON mode drops the SSE requirement.
+
+    SDK-defined: the draft transport's both-types Accept rule binds the client, not the server,
+    and the modern entry answers 406 when the Accept header cannot take every representation the
+    mode may produce. Three arms: on the default mode an Accept without text/event-stream is
+    rejected; in JSON response mode the same Accept is served (no SSE upgrade is possible); an
+    Accept without application/json is rejected even in JSON response mode. The empty 406 body is
+    pinned -- the legacy transport's 406 carries a JSON-RPC error body, so the emptiness is the
+    modern entry's distinct output.
+    """
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "add", "arguments": {"a": 2, "b": 3}, "_meta": _meta_envelope()},
+    }
+    json_only = _modern_headers(method="tools/call", name="add") | {"accept": "application/json"}
+    sse_only = _modern_headers(method="tools/call", name="add") | {"accept": "text/event-stream"}
+    async with mounted_app(_server()) as (http, _):
+        rejected = await http.post("/mcp", json=body, headers=json_only)
+    async with mounted_app(_server(), json_response=True) as (http, _):
+        served = await http.post("/mcp", json=body, headers=json_only)
+        missing_json = await http.post("/mcp", json=body, headers=sse_only)
+
+    assert (rejected.status_code, rejected.content) == snapshot((406, b""))
+    assert served.status_code == 200
+    assert JSONRPCResponse.model_validate(served.json()).id == 1
+    assert (missing_json.status_code, missing_json.content) == snapshot((406, b""))
+
+
 @requirement("hosting:http:modern:handler-exception-internal-error")
 async def test_modern_handler_exception_maps_to_internal_error_without_leaking_the_message() -> None:
     """A handler exception on the 2026-07-28 path returns -32603 with a generic message.
@@ -273,10 +357,12 @@ async def test_modern_server_discover_returns_capabilities_and_supported_version
 async def test_modern_removed_method_is_method_not_found_at_http_404() -> None:
     """A 2026-07-28 ping (removed at 2026) is answered METHOD_NOT_FOUND and the HTTP status is 404.
 
-    Spec-mandated for the error code: ping is not a defined method at 2026-07-28 so the kernel's
-    method/version gate rejects it. SDK-defined for the HTTP status: kernel-origin METHOD_NOT_FOUND
-    travels through the same error-code-to-status table as classifier-origin errors. Asserted at the
-    wire because the HTTP status is the assertion.
+    Spec-mandated for both halves: ping is not a defined method at 2026-07-28 so the kernel's
+    method/version gate rejects it, and the transport page requires 404 Not Found with a -32601
+    JSON-RPC error for a request naming an RPC method the server does not implement. The SDK
+    reaches the status by sending kernel-origin METHOD_NOT_FOUND through the same
+    error-code-to-status table as classifier-origin errors. Asserted at the wire because the
+    HTTP status is the assertion.
     """
     body = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"_meta": _meta_envelope()}}
     async with mounted_app(_server()) as (http, _):
@@ -345,15 +431,17 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
     Spec-mandated under the draft stateless transport: the pinned ``ClientSession`` and the
     single-exchange serving entry compose so that ``call_tool`` returns ``resultType: complete``
     with no ``initialize`` ever sent, no ``Mcp-Session-Id`` on any request or response, and every
-    POST carrying the body-derived ``MCP-Protocol-Version`` / ``Mcp-Method`` / ``Mcp-Name`` headers
-    plus the three-key ``io.modelcontextprotocol/*`` ``_meta`` envelope. The caller passes a
-    ``custom-key`` under ``meta=`` and the server handler captures the incoming ``ctx.meta``,
-    proving the envelope merge is additive: the caller's key sits alongside the three envelope keys
-    on the wire and inside the handler. Asserted at the wire via the ``mounted_app`` httpx event
-    hooks because none of the headers, the envelope, or the handshake-absence is observable through
-    the public client API. The recorded log shows two POSTs: the ``tools/call`` itself and the
-    client's implicit ``tools/list`` output-schema fetch (see ``client:output-schema:auto-list``),
-    both of which must satisfy the stateless contract.
+    POST carrying the body-derived ``MCP-Protocol-Version`` / ``Mcp-Method`` headers (plus
+    ``Mcp-Name`` on the name-bearing ``tools/call``) plus the three-key
+    ``io.modelcontextprotocol/*`` ``_meta`` envelope. The caller passes a ``custom-key`` plus
+    colliding values for all three ``io.modelcontextprotocol/*`` keys under ``meta=`` and the
+    server handler captures the incoming ``ctx.meta``, proving the envelope merge: the three
+    envelope keys overwrite the caller's colliding values and the non-colliding caller key
+    survives alongside them on the wire and inside the handler. Asserted at the wire via the
+    ``mounted_app`` httpx event hooks because none of the headers, the envelope, or the
+    handshake-absence is observable through the public client API. The recorded log shows two
+    POSTs: the ``tools/call`` itself and the client's implicit ``tools/list`` output-schema fetch
+    (see ``client:output-schema:auto-list``), both of which must satisfy the stateless contract.
     """
     observed_metas: list[dict[str, Any]] = []
     server = _server(on_meta=observed_metas.append)
@@ -384,7 +472,12 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
             result = await session.call_tool(
                 "add",
                 {"a": 2, "b": 3},
-                meta={"custom-key": "x", "io.modelcontextprotocol/protocolVersion": "evil"},
+                meta={
+                    "custom-key": "x",
+                    "io.modelcontextprotocol/protocolVersion": "evil",
+                    "io.modelcontextprotocol/clientInfo": "evil",
+                    "io.modelcontextprotocol/clientCapabilities": "evil",
+                },
             )
 
     assert result.model_dump(by_alias=True, mode="json", exclude_none=True) == snapshot(
@@ -399,11 +492,17 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
     )
     assert all("initialize" not in body["method"] for body in bodies)
 
-    # The tools/call POST carries the body-derived headers, and its _meta envelope overwrites the
-    # caller's colliding io.modelcontextprotocol/* key while preserving the non-colliding caller key.
+    # The tools/call POST carries the body-derived headers, and its _meta envelope overwrites all
+    # three of the caller's colliding io.modelcontextprotocol/* keys while preserving the
+    # non-colliding caller key.
     call = requests[0]
     assert {k: v for k, v in call.headers.items() if k.startswith("mcp-")} == snapshot(
         {"mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": "add"}
+    )
+    # The non-name-bearing tools/list carries the protocol-version and method headers but no
+    # Mcp-Name: the name header is scoped to the name-bearing methods.
+    assert {k: v for k, v in requests[1].headers.items() if k.startswith("mcp-")} == snapshot(
+        {"mcp-protocol-version": "2026-07-28", "mcp-method": "tools/list"}
     )
     assert bodies[0]["params"]["_meta"] == snapshot(
         {
@@ -430,6 +529,69 @@ async def test_pinned_client_stateless_tools_call_round_trips_against_the_modern
     assert len(responses) == len(requests)
     assert all("mcp-session-id" not in r.headers for r in requests)
     assert all("mcp-session-id" not in r.headers for r in responses)
+
+
+@requirement("client-transport:http:body-derived-headers")
+async def test_resources_read_and_prompts_get_posts_carry_mcp_name_from_uri_and_prompt_name() -> None:
+    """resources/read and prompts/get POSTs carry the body-derived Mcp-Name header like tools/call does.
+
+    Spec-mandated: the 2026-07-28 Standard Request Headers table requires Mcp-Name on all three
+    name-bearing methods -- from params.uri for resources/read and params.name for prompts/get --
+    not only tools/call (pinned by the stateless round-trip test above). Asserted at the wire via
+    the mounted_app request hook because the client never exposes its outgoing request headers.
+    """
+
+    async def read_resource(ctx: ServerRequestContext, params: ReadResourceRequestParams) -> ReadResourceResult:
+        assert params.uri == "memo://greeting"
+        return ReadResourceResult(
+            contents=[TextResourceContents(uri=params.uri, text="hi")], ttl_ms=0, cache_scope="public"
+        )
+
+    async def get_prompt(ctx: ServerRequestContext, params: GetPromptRequestParams) -> GetPromptResult:
+        assert params.name == "welcome"
+        return GetPromptResult(messages=[PromptMessage(role="user", content=TextContent(text="hello"))])
+
+    server = Server("named", on_read_resource=read_resource, on_get_prompt=get_prompt)
+
+    requests: list[httpx.Request] = []
+
+    async def on_request(request: httpx.Request) -> None:
+        requests.append(request)
+
+    discover = DiscoverResult(
+        supported_versions=[LATEST_MODERN_VERSION],
+        capabilities=ServerCapabilities(),
+        server_info=Implementation(name="srv", version="0"),
+    )
+    with anyio.fail_after(5):
+        async with (
+            mounted_app(server, on_request=on_request) as (http, _),
+            Client(
+                streamable_http_client(f"{BASE_URL}/mcp", http_client=http),
+                mode=LATEST_MODERN_VERSION,
+                prior_discover=discover,
+            ) as client,
+        ):
+            read = await client.read_resource("memo://greeting")
+            prompt = await client.get_prompt("welcome")
+
+    assert read == snapshot(
+        ReadResourceResult(
+            contents=[TextResourceContents(uri="memo://greeting", text="hi")], ttl_ms=0, cache_scope="public"
+        )
+    )
+    assert prompt == snapshot(GetPromptResult(messages=[PromptMessage(role="user", content=TextContent(text="hello"))]))
+
+    # Exactly the two name-bearing POSTs -- neither method triggers implicit follow-up traffic.
+    assert [(r.method, json.loads(r.content)["method"]) for r in requests] == snapshot(
+        [("POST", "resources/read"), ("POST", "prompts/get")]
+    )
+    assert {k: v for k, v in requests[0].headers.items() if k.startswith("mcp-")} == snapshot(
+        {"mcp-protocol-version": "2026-07-28", "mcp-method": "resources/read", "mcp-name": "memo://greeting"}
+    )
+    assert {k: v for k, v in requests[1].headers.items() if k.startswith("mcp-")} == snapshot(
+        {"mcp-protocol-version": "2026-07-28", "mcp-method": "prompts/get", "mcp-name": "welcome"}
+    )
 
 
 _CUSTOM_HEADER_TOOL = Tool(
@@ -504,6 +666,46 @@ async def test_modern_client_mirrors_x_mcp_header_args_into_mcp_param_headers() 
     # Mirroring is additive: the arguments are unchanged in the body.
     assert json.loads(call.content)["params"]["arguments"] == snapshot(
         {"region": "us-west1", "priority": 42, "verbose": False, "note": "héllo"}
+    )
+
+
+@requirement("client-transport:http:custom-param-headers:integer-safe-range")
+async def test_modern_client_mirrors_an_out_of_safe_range_integer_verbatim() -> None:
+    """PINS A KNOWN GAP: an annotated integer argument outside the JavaScript safe range (here
+    2^53, one past the maximum) MUST not be mirrored, but no range check exists on the encode
+    path, so the violating value crosses the wire as its full decimal string. See the
+    requirement's divergence; when enforcement lands, re-pin to the chosen handling and delete
+    the Divergence. Asserted at the wire because the client never surfaces the outgoing headers.
+    """
+    requests: list[httpx.Request] = []
+
+    async def on_request(request: httpx.Request) -> None:
+        requests.append(request)
+
+    discover = DiscoverResult(
+        supported_versions=[LATEST_MODERN_VERSION],
+        capabilities=ServerCapabilities(),
+        server_info=Implementation(name="srv", version="0"),
+    )
+    with anyio.fail_after(5):
+        async with (
+            mounted_app(_custom_header_server(), on_request=on_request) as (http, _),
+            Client(
+                streamable_http_client(f"{BASE_URL}/mcp", http_client=http),
+                mode=LATEST_MODERN_VERSION,
+                prior_discover=discover,
+            ) as client,
+        ):
+            await client.list_tools()
+            await client.call_tool("run", {"region": "us-west1", "priority": 2**53})
+
+    call = next(r for r in requests if json.loads(r.content)["method"] == "tools/call")
+    assert {k: v for k, v in call.headers.items() if k.startswith("mcp-param-")} == snapshot(
+        {"mcp-param-region": "us-west1", "mcp-param-priority": "9007199254740992"}
+    )
+    # The body keeps the exact integer: the divergence is purely the header emission.
+    assert json.loads(call.content)["params"]["arguments"] == snapshot(
+        {"region": "us-west1", "priority": 9007199254740992}
     )
 
 
@@ -1447,7 +1649,7 @@ async def test_modern_request_scoped_push_elicit_loud_fails_locally_and_the_call
     )
 
 
-@requirement("hosting:http:request-headers-in-handler")
+@requirement("hosting:context:web-request-headers")
 async def test_custom_request_header_reaches_the_handler_request_context_on_both_serving_paths() -> None:
     """A custom HTTP header sent by the client reaches the handler's ctx.request on both serving paths.
 
@@ -1503,7 +1705,7 @@ async def test_custom_request_header_reaches_the_handler_request_context_on_both
 async def test_modern_entry_accepts_a_mismatching_mcp_param_header_without_validation() -> None:
     """A tools/call whose Mcp-Param header disagrees with the body argument is accepted, pinning the gap.
 
-    Pins a known divergence (recorded on the entry, issue L110): the spec mandates that any server
+    Pins a known divergence (recorded on the entry): the spec mandates that any server
     processing the message body validate decoded header values against the corresponding body
     values and reject with 400/-32020 HeaderMismatch on any failure, but the inbound ladder
     compares only MCP-Protocol-Version, Mcp-Method and Mcp-Name -- the disagreeing

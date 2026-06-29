@@ -28,11 +28,14 @@ pytestmark = pytest.mark.anyio
 
 
 @requirement("tools:call:content:text")
+@requirement("tools:call:structured-content:text-mirror")
 async def test_call_tool_returns_text_content(connect: Connect) -> None:
     """Arguments reach the tool function; its return value comes back as text content.
 
     MCPServer also derives an output schema from the return annotation and attaches the
-    matching structuredContent to the result.
+    matching structuredContent. The text block is the raw return value, not the serialized
+    JSON of the wrapped structured value -- the primitive half of the divergence on
+    tools:call:structured-content:text-mirror.
     """
     mcp = MCPServer("adder")
 
@@ -435,7 +438,7 @@ async def test_adding_and_removing_tools_does_not_notify_connected_clients(conne
     )
 
 
-@requirement("tools:list:connection-independent")
+@requirement("tools:list:connection-invariant")
 async def test_tool_list_is_identical_across_connections_and_unchanged_by_other_requests(
     connect: Connect,
 ) -> None:

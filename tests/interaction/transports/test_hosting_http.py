@@ -42,6 +42,7 @@ from tests.interaction._connect import (
     initialize_via_http,
     mounted_app,
     parse_sse_messages,
+    post_jsonrpc,
 )
 from tests.interaction._requirements import requirement
 
@@ -189,16 +190,18 @@ async def test_protocol_version_header_is_validated() -> None:
 
 @requirement("hosting:http:protocol-version-rejection-literal")
 @requirement("lifecycle:version:unsupported-32022")
-async def test_unsupported_protocol_version_rejection_body_contains_the_sniffed_literal() -> None:
-    """The 400 body for an unsupported MCP-Protocol-Version contains the substring peer SDKs sniff.
+async def test_unsupported_protocol_version_rejection_body_contains_the_canonical_literal() -> None:
+    """The 400 body for an unsupported MCP-Protocol-Version contains the literal 'Unsupported protocol version'.
 
-    SDK-defined: other SDKs detect this rejection by substring-matching ``Unsupported protocol
-    version`` in the response body, so the literal must survive any rewording of the surrounding
-    message. The unsupported value must appear in both the header and the envelope so the
-    classifier reaches its version-supported rung rather than reporting a header mismatch first.
-    Also pins ``lifecycle:version:unsupported-32022`` (spec basic/versioning#protocol-version-negotiation,
-    a MUST): the -32022 code and the ``data.supported`` list asserted here are the server-side
-    production of the negotiation error, exercised directly rather than through the client retry path.
+    SDK-defined: the literal matches the message in the spec's UnsupportedProtocolVersionError
+    examples and is pinned as wire-stable for any peer that inspects rejection-body text -- no
+    sibling-SDK client is known to substring-match it (the TypeScript probe classifier keys on
+    the -32022 code). The unsupported value must appear in both the header and the envelope so
+    the classifier reaches its version-supported rung rather than reporting a header mismatch
+    first. Also pins `lifecycle:version:unsupported-32022` (spec
+    basic/versioning#protocol-version-negotiation, a MUST): the -32022 code and the
+    `data.supported` list asserted here are the server-side production of the negotiation error,
+    exercised directly rather than through the client retry path.
     """
     bad = "1991-01-01"
     meta = {
@@ -346,6 +349,76 @@ async def test_messages_are_routed_to_exactly_one_stream() -> None:
     assert [type(m).__name__ for m in get_messages] == snapshot(["JSONRPCNotification"])
     assert isinstance(get_messages[0], JSONRPCNotification)
     assert get_messages[0].method == snapshot("notifications/resources/updated")
+
+
+@requirement("hosting:http:send-no-listener-noop")
+async def test_unrelated_notification_with_no_open_get_stream_is_silently_dropped() -> None:
+    """An unrelated notification sent while no standalone GET stream is open is dropped, not raised.
+
+    SDK-defined: the send completes (the tool call still returns its result) and the dropped
+    notification is never delivered -- a standalone stream opened afterwards receives only
+    notifications sent after it attached, which the distinct URIs make observable. The
+    stored-for-replay arm (event store configured) is pinned by hosting:resume:buffered-replay's
+    test instead.
+    """
+
+    async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
+        assert params.name == "touch"
+        assert params.arguments is not None
+        await ctx.session.send_resource_updated(params.arguments["uri"])
+        return CallToolResult(content=[TextContent(text="touched")])
+
+    server = Server("hosted", on_call_tool=call_tool)
+
+    def call_body(request_id: int, uri: str) -> dict[str, object]:
+        params = CallToolRequestParams(name="touch", arguments={"uri": uri})
+        return JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/call", params=params.model_dump()).model_dump(
+            by_alias=True, exclude_none=True
+        )
+
+    async with mounted_app(server) as (http, _):
+        session_id = await initialize_via_http(http)
+
+        # No GET stream exists anywhere yet: the handler's notification has nowhere to go.
+        response, messages = await post_jsonrpc(http, call_body(2, "file:///dropped.txt"), session_id=session_id)
+        assert response.status_code == 200
+        # A successful result proves the unroutable send did not raise inside the handler; the
+        # type-name list proves the notification did not ride the POST stream either.
+        assert [type(m).__name__ for m in messages] == snapshot(["JSONRPCResponse"])
+        assert isinstance(messages[0], JSONRPCResponse)
+        assert CallToolResult.model_validate(messages[0].result) == snapshot(
+            CallToolResult(content=[TextContent(text="touched")])
+        )
+
+        get_events: list[ServerSentEvent] = []
+        standalone_ready = anyio.Event()
+        seen_on_standalone = anyio.Event()
+
+        async def read_standalone_stream() -> None:
+            async with aconnect_sse(http, "GET", "/mcp", headers=base_headers(session_id=session_id)) as get:
+                assert get.response.status_code == 200
+                standalone_ready.set()
+                async for event in get.aiter_sse():
+                    get_events.append(event)
+                    seen_on_standalone.set()
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:  # pragma: no branch
+                tg.start_soon(read_standalone_stream)
+                await standalone_ready.wait()
+                # The probe: with a listener attached, an unrelated notification is delivered.
+                _, probe = await post_jsonrpc(http, call_body(3, "file:///delivered.txt"), session_id=session_id)
+                assert [type(m).__name__ for m in probe] == snapshot(["JSONRPCResponse"])
+                await seen_on_standalone.wait()
+                tg.cancel_scope.cancel()
+
+    # The first message the standalone stream ever carries is the probe's: the server's write
+    # stream is routed in order, so a buffered first notification would have arrived ahead of it.
+    get_messages = parse_sse_messages(get_events)
+    assert isinstance(get_messages[0], JSONRPCNotification)
+    assert (get_messages[0].method, get_messages[0].params) == snapshot(
+        ("notifications/resources/updated", {"uri": "file:///delivered.txt"})
+    )
 
 
 @requirement("hosting:http:dns-rebinding")

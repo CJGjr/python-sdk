@@ -6,6 +6,7 @@ its own importable file (subprocess coverage applies) while the test file follow
 test-only-functions convention.
 """
 
+import os
 import sys
 import warnings
 
@@ -33,14 +34,20 @@ async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams |
             Tool(
                 name="echo",
                 input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
-            )
+            ),
+            Tool(
+                name="read_env",
+                input_schema={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+            ),
         ]
     )
 
 
 async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
-    assert params.name == "echo"
     assert params.arguments is not None
+    if params.name == "read_env":
+        return CallToolResult(content=[TextContent(text=os.environ.get(params.arguments["name"], "<unset>"))])
+    assert params.name == "echo"
     text = params.arguments["text"]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", MCPDeprecationWarning)

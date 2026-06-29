@@ -11,8 +11,17 @@ import re
 import anyio
 import httpx
 import pytest
+from httpx_sse import ServerSentEvent, aconnect_sse
 from inline_snapshot import snapshot
-from mcp_types import JSONRPCResponse, ListToolsResult, PaginatedRequestParams, Tool
+from mcp_types import (
+    CallToolRequestParams,
+    CallToolResult,
+    JSONRPCRequest,
+    JSONRPCResponse,
+    ListToolsResult,
+    PaginatedRequestParams,
+    Tool,
+)
 
 from mcp.server import Server, ServerRequestContext
 from tests.interaction._connect import (
@@ -21,6 +30,7 @@ from tests.interaction._connect import (
     initialize_body,
     initialize_via_http,
     mounted_app,
+    parse_sse_messages,
     post_jsonrpc,
 )
 from tests.interaction._requirements import requirement
@@ -127,6 +137,74 @@ async def test_delete_terminates_the_session_and_subsequent_requests_return_404(
         )
 
 
+@requirement("hosting:session:delete-cancels-inflight")
+async def test_delete_cancels_in_flight_handlers_and_their_streams_close_without_a_response() -> None:
+    """DELETE on a session cancels every in-flight handler; their POST streams close with no response.
+
+    SDK-defined: session termination is the trigger (the modern era's equivalent trigger, client
+    disconnect, is pinned by hosting:http:modern:disconnect-cancels-handler). Steps:
+
+    1. park two tools/call requests on the same session, each holding its POST SSE stream open;
+    2. DELETE the session once both handlers are provably running;
+    3. await both handlers' cancellation exceptions -- the app is still mounted, so DELETE is the
+       only possible canceller;
+    4. the task-group join proves both POST streams closed (each reader runs to stream end), and
+       the collected events prove no JSON-RPC message was written on either.
+    """
+    started = {slot: anyio.Event() for slot in ("a", "b")}
+    cancelled = {slot: anyio.Event() for slot in ("a", "b")}
+
+    async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
+        assert params.name == "hang"
+        assert params.arguments is not None
+        slot = params.arguments["slot"]
+        started[slot].set()
+        try:
+            # Parked with no normal exit: cancellation is the only way out (the loop spells out
+            # what sleep_forever's annotation does not promise).
+            while True:
+                await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            cancelled[slot].set()
+            raise
+
+    server = Server("hosted", on_call_tool=call_tool)
+    post_events: dict[str, list[ServerSentEvent]] = {"a": [], "b": []}
+
+    async with mounted_app(server) as (http, _):
+        session_id = await initialize_via_http(http)
+
+        async def post_parked_call(slot: str, request_id: int) -> None:
+            params = CallToolRequestParams(name="hang", arguments={"slot": slot})
+            body = JSONRPCRequest(jsonrpc="2.0", id=request_id, method="tools/call", params=params.model_dump())
+            async with aconnect_sse(
+                http,
+                "POST",
+                "/mcp",
+                json=body.model_dump(by_alias=True, exclude_none=True),
+                headers=base_headers(session_id=session_id),
+            ) as post:
+                assert post.response.status_code == 200
+                post_events[slot] = [event async for event in post.aiter_sse()]
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg:  # pragma: no branch
+                tg.start_soon(post_parked_call, "a", 2)
+                tg.start_soon(post_parked_call, "b", 3)
+                await started["a"].wait()
+                await started["b"].wait()
+
+                delete = await http.delete("/mcp", headers=base_headers(session_id=session_id))
+                assert delete.status_code == 200
+
+                await cancelled["a"].wait()
+                await cancelled["b"].wait()
+                # No cancel here: the join completes only when the server ends both POST streams.
+
+    assert parse_sse_messages(post_events["a"]) == []
+    assert parse_sse_messages(post_events["b"]) == []
+
+
 @requirement("hosting:session:isolation")
 async def test_terminating_one_session_leaves_others_working() -> None:
     """Terminating one session on a manager does not disturb a concurrent session on the same manager."""
@@ -200,3 +278,23 @@ async def test_stateless_mode_serves_concurrent_clients_independently() -> None:
 
     assert results["a"].tools[0].name == "noop"
     assert results["b"].tools[0].name == "noop"
+
+
+@requirement("hosting:stateless:get-delete-405")
+async def test_stateless_delete_returns_405_but_get_opens_an_sse_stream() -> None:
+    """A stateless DELETE is rejected with 405; a stateless GET is served instead of rejected.
+
+    See the divergence on the requirement: with no session to stream to or terminate the entry
+    expects 405 for both methods, but the SDK routes a stateless GET through the standalone-SSE
+    path, answering 200 with an event stream no server message can ever reach.
+    """
+    async with mounted_app(_server(), stateless_http=True) as (http, _):
+        delete = await http.delete("/mcp", headers=base_headers())
+
+        async with aconnect_sse(http, "GET", "/mcp", headers=base_headers()) as get:
+            assert get.response.status_code == 200
+            assert get.response.headers["content-type"].split(";", 1)[0] == "text/event-stream"
+
+    assert (delete.status_code, delete.json()["error"]["message"]) == snapshot(
+        (405, "Method Not Allowed: Session termination not supported")
+    )
